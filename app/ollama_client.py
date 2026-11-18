@@ -50,8 +50,10 @@ class OllamaClient:
 Classify a resident's message for a landlord management system.
 Return JSON only with keys: intent, summary, urgency, payment_categories,
 billing_period, amount_claimed, requires_attachment.
-intent must be maintenance_request, payment_submission, balance_inquiry,
+intent must be maintenance_request, payment_submission, payment_history, balance_inquiry,
 billing_question, or general_chat.
+Use payment_history for requests to see past payments, receipts, collection dates,
+or payment approval status. A question about previous payments is not a new submission.
 urgency must be low, normal, high, or emergency.
 payment_categories must be a JSON list containing only rent, electricity,
 water, or other. Use an empty list when payment is unrelated.
@@ -93,6 +95,7 @@ Do not invent details.
         if intent not in {
             "maintenance_request",
             "payment_submission",
+            "payment_history",
             "balance_inquiry",
             "billing_question",
             "general_chat",

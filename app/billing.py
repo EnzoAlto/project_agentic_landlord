@@ -289,7 +289,7 @@ class BillingService:
             raise ValueError("Billing period must use YYYY-MM")
         year, month = (int(part) for part in billing_period.split("-"))
         last_day = calendar.monthrange(year, month)[1]
-        return date(year, month, min(due_day, last_day)).isoformat()
+        return date(year, month, min(int(due_day), last_day)).isoformat()
 
     def upsert_bill(
         self,
@@ -396,7 +396,77 @@ class BillingService:
                         """,
                         (bill_id, cursor.lastrowid, applied_credit),
                     )
+        if _connection is not None:
+            return _bill_from_row(_connection.execute(
+                self._bill_sql() + ' WHERE b.id = ?', (bill_id,)
+            ).fetchone())
         return self.get_bill(bill_id)
+
+    def rent_for_period(self, unit_id: int, period: str) -> int:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                'SELECT amount_cents FROM rent_rates WHERE unit_id = ? AND effective_period <= ? ORDER BY effective_period DESC LIMIT 1',
+                (unit_id, period),
+            ).fetchone()
+        return int(row[0]) if row else self.get_unit(unit_id).rent_parking_cents
+
+    def save_month_table(self, period: str, records: list[dict]) -> None:
+        """Save edits, forward rent rates, and monthly utility entries atomically."""
+        records = [
+            {key: None if isinstance(value, float) and math.isnan(value) else value
+             for key, value in record.items()}
+            for record in records
+        ]
+        units = {unit.id: unit for unit in self.list_units()}
+        rates = {unit_id: self.rent_for_period(unit_id, period) for unit_id in units}
+        with self.database.connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            # Clear links first so exchanging two group assignments works.
+            for record in records:
+                connection.execute('UPDATE units SET telegram_group_chat_id = NULL WHERE id = ?', (record['id'],))
+            self.update_units([
+                {**record, 'rent_parking': units[record['id']].rent_parking_cents / 100}
+                for record in records
+            ], _connection=connection)
+            for record in records:
+                unit_id = record['id']
+                amount = money_to_cents(record['rent_parking'])
+                if amount != rates[unit_id]:
+                    affected = connection.execute(
+                        '''SELECT b.id FROM monthly_bills b WHERE b.unit_id = ? AND b.billing_period >= ?
+                           AND EXISTS(SELECT 1 FROM bill_allocations x WHERE x.bill_id = b.id)''',
+                        (unit_id, period),
+                    ).fetchall()
+                    if affected:
+                        raise ValueError(f"Unit {units[unit_id].unit_number}: rent change affects a bill with payments applied. Review that bill before changing rent.")
+                    connection.execute('DELETE FROM rent_rates WHERE unit_id = ? AND effective_period >= ?', (unit_id, period))
+                    connection.execute('INSERT INTO rent_rates VALUES (?, ?, ?)', (unit_id, period, amount))
+                    connection.execute(
+                        '''UPDATE monthly_bills SET total_due_cents = total_due_cents - rent_parking_cents + ?,
+                           rent_parking_cents = ? WHERE unit_id = ? AND billing_period >= ?''',
+                        (amount, amount, unit_id, period),
+                    )
+                if units[unit_id].occupancy_status == 'vacant':
+                    continue
+                existing = connection.execute(
+                    'SELECT notes FROM monthly_bills WHERE unit_id = ? AND billing_period = ?',
+                    (unit_id, period),
+                ).fetchone()
+                bill = self.upsert_bill(
+                    unit_id=unit_id, billing_period=period,
+                    rent_parking=record['rent_parking'],
+                    water_previous=record['water_previous'], water_present=record['water_present'],
+                    water_bill=record['water_bill'] if record['water_bill'] is not None else 0,
+                    electricity_previous=record['electricity_previous'], electricity_present=record['electricity_present'],
+                    electricity_bill=record['electricity_bill'] if record['electricity_bill'] is not None else 0,
+                    notes=(existing['notes'] or '') if existing else '',
+                    _connection=connection,
+                )
+                connection.execute(
+                    'UPDATE monthly_bills SET due_date = ?, water_entered = ?, electricity_entered = ? WHERE id = ?',
+                    (self._due_date(period, record['due_day']), True,
+                     True, bill.id),
+                )
 
     def get_bill(self, bill_id: int) -> MonthlyBill:
         with self.database.connection() as connection:

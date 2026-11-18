@@ -76,6 +76,43 @@ class BillingServiceTests(unittest.TestCase):
         self.assertEqual(bill.outstanding_cents, 800_000)
         self.assertEqual(bill.due_date, "2026-11-09")
 
+    def test_month_table_rent_changes_preserve_past_and_update_future(self):
+        october = self._bill('2026-10')
+        november = self._bill('2026-11')
+        december = self._bill('2026-12')
+        record = {
+            'id': self.unit.id, 'resident_name': self.unit.resident_name,
+            'due_day': 9, 'rent_parking': 8000,
+            'telegram_group_chat_id': -100123,
+            'water_previous': 100, 'water_present': 110, 'water_bill': 500,
+            'electricity_previous': None, 'electricity_present': None,
+            'electricity_bill': 0,
+        }
+        self.billing.save_month_table('2026-11', [record])
+        self.assertEqual(self.billing.get_bill(october.id).rent_parking_cents, 750000)
+        self.assertEqual(self.billing.get_bill(november.id).rent_parking_cents, 800000)
+        self.assertEqual(self.billing.get_bill(december.id).rent_parking_cents, 800000)
+        self.assertEqual(self.billing.rent_for_period(self.unit.id, '2027-01'), 800000)
+        self.assertEqual(self.billing.rent_for_period(self.unit.id, '2026-09'), 750000)
+
+    def test_month_table_blocks_paid_future_rent_changes_atomically(self):
+        december = self._bill('2026-12')
+        submission = self._submission()
+        self.billing.apply_payment(submission_id=submission.id, bill_id=december.id,
+            amount_received=100, fully_paid=False, received_date='2026-12-09')
+        record = {
+            'id': self.unit.id, 'resident_name': 'Changed name',
+            'due_day': 9, 'rent_parking': 8000,
+            'telegram_group_chat_id': -100123,
+            'water_previous': None, 'water_present': None, 'water_bill': None,
+            'electricity_previous': None, 'electricity_present': None,
+            'electricity_bill': None,
+        }
+        with self.assertRaises(ValueError):
+            self.billing.save_month_table('2026-11', [record])
+        self.assertEqual(self.billing.get_unit(self.unit.id).resident_name, self.unit.resident_name)
+        self.assertEqual(self.billing.rent_for_period(self.unit.id, '2026-11'), 750000)
+
     def test_partial_payment_leaves_remaining_balance(self):
         bill = self._bill()
         submission = self._submission()

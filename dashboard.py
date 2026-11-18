@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import streamlit as st
@@ -13,6 +13,7 @@ from app.config import Settings
 from app.database import Database
 from app.maintenance import MaintenanceService, VALID_STATUSES
 from app.payments import PaymentService, PaymentSubmission
+from app.reminders import ReminderService
 
 
 PAYMENT_STATUS_LABELS = {
@@ -30,6 +31,7 @@ MAINTENANCE_STATUS_LABELS = {
     "closed": "Closed",
 }
 BILL_STATUS_LABELS = {
+    "incomplete": "Incomplete",
     "unpaid": "Unpaid",
     "partially_paid": "Partially paid",
     "paid": "Paid",
@@ -362,252 +364,84 @@ def _render_monthly_ledger(billing: BillingService) -> None:
 
 
 def _render_billing_setup(billing: BillingService) -> None:
-    st.subheader("Unit directory and Telegram connection")
-    st.caption(
-        "Edit the resident, due day, or rent directly. Use the Telegram group "
-        "dropdown in each row to connect that unit to the bot."
-    )
+    st.subheader("Monthly billing setup")
+    months = [date(year, month, 1).strftime("%Y-%m")
+              for year in range(date.today().year - 2, date.today().year + 4)
+              for month in range(1, 13)]
+    months = sorted(set(months + [bill.billing_period for bill in billing.list_bills()]))
+    period = st.selectbox("Billing month", months,
+                          index=months.index(date.today().strftime("%Y-%m")),
+                          key="billing_month")
+    st.caption("Rent changes apply from this month onward. Utilities apply only to this month. Save changes before switching months.")
     units = billing.list_units()
     groups = billing.list_telegram_groups()
-    title_counts = Counter(str(group["title"]) for group in groups)
-    group_labels: dict[int, str] = {}
-    for group in groups:
-        chat_id = int(group["chat_id"])
-        title = str(group["title"])
-        group_labels[chat_id] = (
-            f"{title} ({chat_id})" if title_counts[title] > 1 else title
-        )
-    label_to_group = {label: chat_id for chat_id, label in group_labels.items()}
-    no_group_label = "Not connected"
-
-    directory_rows = []
+    labels = {int(group["chat_id"]): f"{group['title']} ({group['chat_id']})"
+              for group in groups}
+    reverse_labels = {label: chat_id for chat_id, label in labels.items()}
+    current = {bill.unit_id: bill for bill in billing.list_bills()
+               if bill.billing_period == period}
+    year, month = map(int, period.split("-"))
+    previous_period = (date(year, month, 1) - timedelta(days=1)).strftime("%Y-%m")
+    previous = {bill.unit_id: bill for bill in billing.list_bills()
+                if bill.billing_period == previous_period}
+    rows = []
     for unit in units:
-        group_label = (
-            group_labels.get(unit.telegram_group_chat_id, no_group_label)
-            if unit.telegram_group_chat_id is not None
-            else no_group_label
-        )
-        directory_rows.append(
-            {
-                "_id": unit.id,
-                "Unit": unit.unit_number,
-                "Name": unit.resident_name,
-                "Due day": unit.due_day,
-                "Amount": unit.rent_parking_cents / 100,
-                "Status": unit.chatbot_status,
-                "Telegram group": group_label,
-                "Chat ID": (
-                    str(unit.telegram_group_chat_id)
-                    if unit.telegram_group_chat_id is not None
-                    else "—"
-                ),
-            }
-        )
-
-    edited_directory = st.data_editor(
-        directory_rows,
-        width="stretch",
-        hide_index=True,
-        disabled=["Unit", "Status", "Chat ID"],
-        column_config={
-            "_id": None,
-            "Unit": st.column_config.TextColumn("Unit", width="small"),
-            "Name": st.column_config.TextColumn("Name", required=True),
-            "Due day": st.column_config.NumberColumn(
-                "Due", min_value=1, max_value=31, step=1, width="small"
-            ),
-            "Amount": st.column_config.NumberColumn(
-                "Rent + parking", min_value=0.0, step=500.0, format="₱%.2f"
-            ),
-            "Status": st.column_config.TextColumn("Bot status"),
-            "Telegram group": st.column_config.SelectboxColumn(
-                "Telegram group",
-                options=[no_group_label, *label_to_group],
-                required=True,
-            ),
-            "Chat ID": st.column_config.TextColumn("Chat ID"),
-        },
-        key="unit_directory_editor",
-    )
-    if st.button("Save unit directory", type="primary"):
-        rows = (
-            edited_directory.to_dict("records")
-            if hasattr(edited_directory, "to_dict")
-            else list(edited_directory)
-        )
+        bill = current.get(unit.id)
+        prior = previous.get(unit.id)
+        water = bill.water_bill_cents / 100 if bill else 0.0
+        electricity = bill.electricity_bill_cents / 100 if bill else 0.0
+        rent = bill.rent_parking_cents / 100 if bill else billing.rent_for_period(unit.id, period) / 100
+        rows.append({
+            "_id": unit.id, "Unit": unit.unit_number, "Name": unit.resident_name,
+            "Due day": unit.due_day, "Rent + parking": rent,
+            "Water previous": bill.water_previous if bill else prior.water_present if prior else None,
+            "Water present": bill.water_present if bill else None,
+            "Water difference": bill.water_difference if bill else None,
+            "Water bill": water,
+            "Electricity previous": bill.electricity_previous if bill else prior.electricity_present if prior else None,
+            "Electricity present": bill.electricity_present if bill else None,
+            "Electricity difference": bill.electricity_difference if bill else None,
+            "Electricity bill": electricity,
+            "Total": rent + water + electricity,
+            "Bot status": unit.chatbot_status,
+            "Telegram group": labels.get(unit.telegram_group_chat_id, "Not connected"),
+            "Chat ID": str(unit.telegram_group_chat_id) if unit.telegram_group_chat_id else "—",
+        })
+    config = {
+        "_id": None,
+        "Due day": st.column_config.NumberColumn("Due day", min_value=1, max_value=31, step=1),
+        "Telegram group": st.column_config.SelectboxColumn(
+            "Telegram group", options=["Not connected", *reverse_labels], required=True),
+    }
+    for column in ("Rent + parking", "Water bill", "Electricity bill", "Total"):
+        config[column] = st.column_config.NumberColumn(column, min_value=0.0, format="₱%.2f")
+    for column in ("Water previous", "Water present", "Electricity previous", "Electricity present"):
+        config[column] = st.column_config.NumberColumn(column, min_value=0.0)
+    edited = st.data_editor(rows, column_config=config, hide_index=True,
+        disabled=["Unit", "Water difference", "Electricity difference", "Total", "Bot status", "Chat ID"],
+        width="stretch", key=f"monthly_editor_{period}")
+    edited_rows = edited.to_dict("records") if hasattr(edited, "to_dict") else list(edited)
+    st.caption("Blank utility amounts count as ₱0. Calculated columns refresh after saving.")
+    if st.button("Save monthly table", type="primary"):
         records = []
-        for row in rows:
-            selected_label = row["Telegram group"]
-            records.append(
-                {
-                    "id": row["_id"],
-                    "resident_name": row["Name"],
-                    "due_day": row["Due day"],
-                    "rent_parking": row["Amount"],
-                    "telegram_group_chat_id": (
-                        None
-                        if selected_label == no_group_label
-                        else label_to_group[selected_label]
-                    ),
-                }
-            )
-        billing.update_units(records)
-        st.success("Unit directory and Telegram assignments saved.")
-        st.rerun()
-
-    unassigned_groups = [
-        group
-        for group in groups
-        if int(group["chat_id"])
-        not in {
-            unit.telegram_group_chat_id
-            for unit in units
-            if unit.telegram_group_chat_id is not None
-        }
-    ]
-    if unassigned_groups:
-        st.info(
-            f"{len(unassigned_groups)} Telegram group(s) are available but "
-            "not assigned to a unit. Use a row dropdown to connect them."
-        )
-
-    st.divider()
-    st.subheader("Create or update monthly bill")
-    occupied_units = [
-        unit for unit in billing.list_units()
-        if unit.occupancy_status == "occupied"
-    ]
-    if not occupied_units:
-        st.info("No occupied units are configured.")
-        return
-    unit_ids = [unit.id for unit in occupied_units]
-    bill_unit_id = st.selectbox(
-        "Unit",
-        unit_ids,
-        format_func=lambda value: next(
-            f"Unit {unit.unit_number} · {unit.resident_name}"
-            for unit in occupied_units if unit.id == value
-        ),
-        key="bill_unit",
-    )
-    unit = next(
-        item for item in occupied_units if item.id == bill_unit_id
-    )
-    period_date = st.date_input("Billing month", value=date.today().replace(day=1))
-    period = period_date.strftime("%Y-%m")
-    existing_bill = next(
-        (
-            bill
-            for bill in billing.list_bills(unit_id=bill_unit_id)
-            if bill.billing_period == period
-        ),
-        None,
-    )
-    input_suffix = f"{bill_unit_id}_{period}"
-    if existing_bill is not None:
-        st.info("This billing period already exists. Saving will update it.")
-
-    rent_value = st.number_input(
-        "Rent + parking",
-        min_value=0.0,
-        value=(
-            existing_bill.rent_parking_cents / 100
-            if existing_bill is not None
-            else unit.rent_parking_cents / 100
-        ),
-        step=500.0,
-        format="%.2f",
-        key=f"bill_rent_{input_suffix}",
-    )
-    water_columns = st.columns(3)
-    water_previous = water_columns[0].number_input(
-        "Water previous",
-        min_value=0.0,
-        value=existing_bill.water_previous if existing_bill else None,
-        key=f"water_previous_{input_suffix}",
-    )
-    water_present = water_columns[1].number_input(
-        "Water present",
-        min_value=0.0,
-        value=existing_bill.water_present if existing_bill else None,
-        key=f"water_present_{input_suffix}",
-    )
-    water_difference = (
-        water_present - water_previous
-        if water_previous is not None and water_present is not None
-        else None
-    )
-    water_columns[2].metric(
-        "Water difference",
-        f"{water_difference:g}" if water_difference is not None else "—",
-    )
-    water_bill = st.number_input(
-        "Water bill (manual)",
-        min_value=0.0,
-        value=(existing_bill.water_bill_cents / 100 if existing_bill else 0.0),
-        step=50.0,
-        format="%.2f",
-        key=f"water_bill_{input_suffix}",
-    )
-
-    electricity_columns = st.columns(3)
-    electricity_previous = electricity_columns[0].number_input(
-        "Electricity previous",
-        min_value=0.0,
-        value=existing_bill.electricity_previous if existing_bill else None,
-        key=f"electricity_previous_{input_suffix}",
-    )
-    electricity_present = electricity_columns[1].number_input(
-        "Electricity present",
-        min_value=0.0,
-        value=existing_bill.electricity_present if existing_bill else None,
-        key=f"electricity_present_{input_suffix}",
-    )
-    electricity_difference = (
-        electricity_present - electricity_previous
-        if electricity_previous is not None and electricity_present is not None
-        else None
-    )
-    electricity_columns[2].metric(
-        "Electricity difference",
-        f"{electricity_difference:g}"
-        if electricity_difference is not None
-        else "—",
-    )
-    electricity_bill = st.number_input(
-        "Electricity bill (manual)",
-        min_value=0.0,
-        value=(
-            existing_bill.electricity_bill_cents / 100
-            if existing_bill
-            else 0.0
-        ),
-        step=100.0,
-        format="%.2f",
-        key=f"electricity_bill_{input_suffix}",
-    )
-    notes = st.text_area(
-        "Bill notes (optional)",
-        value=existing_bill.notes or "" if existing_bill else "",
-        key=f"bill_notes_{input_suffix}",
-    )
-    estimated_total = rent_value + water_bill + electricity_bill
-    st.metric("Bill total", f"₱{estimated_total:,.2f}")
-    if st.button("Save monthly bill", type="primary"):
-        billing.upsert_bill(
-            unit_id=bill_unit_id,
-            billing_period=period,
-            rent_parking=rent_value,
-            water_previous=water_previous,
-            water_present=water_present,
-            water_bill=water_bill,
-            electricity_previous=electricity_previous,
-            electricity_present=electricity_present,
-            electricity_bill=electricity_bill,
-            notes=notes,
-        )
-        st.success("Monthly bill saved.")
-        st.rerun()
+        for row in edited_rows:
+            records.append({
+                "id": row["_id"], "resident_name": row["Name"],
+                "due_day": row["Due day"], "rent_parking": row["Rent + parking"],
+                "telegram_group_chat_id": reverse_labels.get(row["Telegram group"]),
+                "water_previous": row["Water previous"], "water_present": row["Water present"],
+                "water_bill": row["Water bill"],
+                "electricity_previous": row["Electricity previous"],
+                "electricity_present": row["Electricity present"],
+                "electricity_bill": row["Electricity bill"],
+            })
+        try:
+            billing.save_month_table(period, records)
+        except (ValueError, LookupError) as exc:
+            st.error(str(exc))
+        else:
+            st.session_state.pop(f"monthly_editor_{period}", None)
+            st.rerun()
 
 
 def _render_submission_history(payments: PaymentService) -> None:
@@ -635,6 +469,19 @@ def _render_payments(
     billing: BillingService,
     proof_root: Path,
 ) -> None:
+    st.caption(
+        'Monthly reminders are queued on the due date in Manila time for saved, unpaid bills. '
+        'If the bot was offline, it catches up later in the same month. '
+        'Keep the Telegram bot running to deliver reminders.'
+    )
+    if st.button('Send test bill alerts to all known chats', key='test_bill_alerts'):
+        count = ReminderService(billing.database).queue_reminders(test=True)
+        st.success(f'{count} test reminder(s) queued for Telegram delivery.')
+    st.caption(
+        'Test alerts go to all known Chat IDs, including private chats. '
+        'Assigned groups receive their own current bill; chats without a bill receive a generic reminder. '
+        'Fully paid bills are skipped. Test alerts can be repeated.'
+    )
     review_tab, ledger_tab, setup_tab, history_tab = st.tabs(
         ["Review queue", "Monthly ledger", "Billing setup", "Submission history"]
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
 from pathlib import Path
 import re
 import time
@@ -14,6 +15,8 @@ from app.database import Database
 from app.maintenance import MaintenanceService
 from app.ollama_client import IntentResult, OllamaResponseError
 from app.payments import PaymentService
+from app.reminders import ReminderService
+from app.payment_history import PAYMENT_HISTORY_PROMPT, group_payment_context
 
 
 class TelegramAPIError(RuntimeError):
@@ -266,6 +269,16 @@ class LandlordBot:
         )
         return True
 
+    def _reply_with_payment_history(self, chat_id: int, question: str) -> None:
+        context = group_payment_context(self.database, chat_id)
+        reply = self.assistant.chat([
+            {'role': 'system', 'content': PAYMENT_HISTORY_PROMPT},
+            {'role': 'user', 'content': json.dumps({
+                'question': question, 'authorized_records': context,
+            }, ensure_ascii=False)},
+        ])
+        self.telegram.send_message(chat_id, reply)
+
     def handle_update(self, update: dict) -> bool:
         update_id = update.get("update_id")
         if not isinstance(update_id, int):
@@ -339,8 +352,10 @@ class LandlordBot:
                 self.telegram.send_message(
                     chat_id,
                     "Mention me with a maintenance or payment request.\n"
-                    "Commands: /tickets, /payment, /reset",
+                    "Commands: /tickets, /payment, /payments, /reset",
                 )
+            elif command == "/payments":
+                self._reply_with_payment_history(chat_id, 'Show our payment history.')
             elif command == "/reset":
                 self.conversation_history.pop(chat_id, None)
                 self.telegram.send_message(chat_id, "Conversation memory cleared.")
@@ -408,12 +423,8 @@ class LandlordBot:
                         sender_name=sender_name,
                         intent=intent,
                     )
-                elif intent.intent in {"balance_inquiry", "billing_question"}:
-                    self.telegram.send_message(
-                        chat_id,
-                        "Billing balances are not configured in this prototype yet. "
-                        "The landlord can still review submitted payment proof.",
-                    )
+                elif intent.intent in {"payment_history", "balance_inquiry", "billing_question"}:
+                    self._reply_with_payment_history(chat_id, cleaned)
                 else:
                     history = self.conversation_history[chat_id]
                     history.append({"role": "user", "content": cleaned})
@@ -457,6 +468,7 @@ class LandlordBot:
         print("Landlord Telegram bot is online. Press Ctrl+C to stop.")
         while True:
             try:
+                ReminderService(self.database).queue_reminders()
                 self.flush_outbox()
                 updates = self.telegram.get_updates(offset)
                 for update in updates:

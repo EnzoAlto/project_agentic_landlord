@@ -36,6 +36,10 @@ DEFAULT_UNITS = (
 
 
 BASE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS billing_reminders (
+    bill_id INTEGER PRIMARY KEY REFERENCES monthly_bills(id),
+    queued_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS rent_rates (
     unit_id INTEGER NOT NULL REFERENCES units(id),
     effective_period TEXT NOT NULL,
