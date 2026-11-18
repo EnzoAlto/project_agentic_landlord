@@ -1,0 +1,2 @@
+"""Landlord management application package."""
+

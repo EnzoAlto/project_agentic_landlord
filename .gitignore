@@ -1,0 +1,13 @@
+.env
+*.py[cod]
+__pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+data/*.db
+data/*.db-*
+data/*.log
+data/payment_proofs/
+.streamlit/secrets.toml
+

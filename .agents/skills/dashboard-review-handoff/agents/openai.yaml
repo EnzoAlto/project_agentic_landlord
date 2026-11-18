@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dashboard Review Handoff"
+  short_description: "Pause dashboard work for user review"
+  default_prompt: "Use $dashboard-review-handoff when changing this dashboard."
