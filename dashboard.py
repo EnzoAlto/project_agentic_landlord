@@ -422,7 +422,16 @@ def _render_billing_setup(billing: BillingService) -> None:
         width="stretch", key=f"monthly_editor_{period}")
     edited_rows = edited.to_dict("records") if hasattr(edited, "to_dict") else list(edited)
     st.caption("Blank utility amounts count as ₱0. Calculated columns refresh after saving.")
-    if st.button("Save monthly table", type="primary"):
+    with st.container(horizontal=True, wrap=False, gap="small"):
+        save_clicked = st.button("Save monthly table", type="primary", width="content")
+        alert_clicked = st.button(
+            'Send test bill alerts to all known chats', key='test_bill_alerts', width="content"
+        )
+    st.caption('Sends a payment reminder to all Residents')
+    if alert_clicked:
+        count = ReminderService(billing.database).queue_reminders(test=True)
+        st.success(f'{count} test reminder(s) queued for Telegram delivery.')
+    if save_clicked:
         records = []
         for row in edited_rows:
             records.append({
@@ -469,19 +478,6 @@ def _render_payments(
     billing: BillingService,
     proof_root: Path,
 ) -> None:
-    st.caption(
-        'Monthly reminders are queued on the due date in Manila time for saved, unpaid bills. '
-        'If the bot was offline, it catches up later in the same month. '
-        'Keep the Telegram bot running to deliver reminders.'
-    )
-    if st.button('Send test bill alerts to all known chats', key='test_bill_alerts'):
-        count = ReminderService(billing.database).queue_reminders(test=True)
-        st.success(f'{count} test reminder(s) queued for Telegram delivery.')
-    st.caption(
-        'Test alerts go to all known Chat IDs, including private chats. '
-        'Assigned groups receive their own current bill; chats without a bill receive a generic reminder. '
-        'Fully paid bills are skipped. Test alerts can be repeated.'
-    )
     review_tab, ledger_tab, setup_tab, history_tab = st.tabs(
         ["Review queue", "Monthly ledger", "Billing setup", "Submission history"]
     )
