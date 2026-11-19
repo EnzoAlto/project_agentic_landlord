@@ -36,6 +36,13 @@ DEFAULT_UNITS = (
 
 
 BASE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS payment_proof_cleanup (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    submission_id INTEGER NOT NULL,
+    proof_path TEXT NOT NULL UNIQUE,
+    last_error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS billing_reminders (
     bill_id INTEGER PRIMARY KEY REFERENCES monthly_bills(id),
     queued_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP

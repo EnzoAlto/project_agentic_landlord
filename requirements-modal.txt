@@ -1,0 +1,2 @@
+# Deployment client only; CPU runtime dependencies are defined in modal_worker.py.
+modal==1.6.4

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
+from uuid import uuid4
 from pathlib import Path
 import re
 import time
@@ -17,6 +18,7 @@ from app.ollama_client import IntentResult, OllamaResponseError
 from app.payments import PaymentService
 from app.reminders import ReminderService
 from app.payment_history import PAYMENT_HISTORY_PROMPT, group_payment_context
+from app.proof_cleanup import cleanup_reviewed_proofs
 
 
 class TelegramAPIError(RuntimeError):
@@ -253,7 +255,7 @@ class LandlordBot:
             )
             return True
 
-        destination = self.proof_dir / f"payment_{submission.id}{suffix}"
+        destination = self.proof_dir / f"payment_{submission.id}_{uuid4().hex}{suffix}"
         self.telegram.download_file(file_id, destination)
         updated = self.payments.attach_proof(
             submission_id=submission.id,
@@ -468,6 +470,7 @@ class LandlordBot:
         print("Landlord Telegram bot is online. Press Ctrl+C to stop.")
         while True:
             try:
+                cleanup_reviewed_proofs(self.database, self.proof_dir)
                 ReminderService(self.database).queue_reminders()
                 self.flush_outbox()
                 updates = self.telegram.get_updates(offset)

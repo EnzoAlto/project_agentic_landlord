@@ -12,6 +12,7 @@ import math
 import re
 
 from app.database import Database
+from app.proof_cleanup import queue_proof_cleanup, cleanup_reviewed_proofs
 
 
 PERIOD_PATTERN = re.compile(r"^\d{4}-\d{2}$")
@@ -153,8 +154,9 @@ def _bill_from_row(row) -> MonthlyBill:  # type: ignore[no-untyped-def]
 
 
 class BillingService:
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, *, cleanup_proofs: bool = True):
         self.database = database
+        self.cleanup_proofs = cleanup_proofs
 
     @staticmethod
     def _unit_sql() -> str:
@@ -534,7 +536,7 @@ class BillingService:
             ).fetchone()
             if submission is None or bill is None:
                 raise LookupError("Payment submission or monthly bill was not found")
-            if submission["status"] not in {"pending_review", "needs_information"}:
+            if submission["status"] != 'pending_review':
                 raise ValueError(f"Submission is already {submission['status']}")
             if submission["group_chat_id"] != bill["telegram_group_chat_id"]:
                 raise ValueError("Payment and bill must belong to the same unit group")
@@ -619,7 +621,10 @@ class BillingService:
                 "INSERT INTO telegram_outbox(chat_id, text) VALUES (?, ?)",
                 (submission["group_chat_id"], notification),
             )
+            queue_proof_cleanup(connection, submission)
 
+        if self.cleanup_proofs:
+            cleanup_reviewed_proofs(self.database)
         return PaymentApplication(
             submission_id=submission_id,
             bill_id=bill_id,

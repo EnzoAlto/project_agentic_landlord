@@ -43,12 +43,18 @@ class Settings:
     ollama_model: str
     database_path: Path
     payment_proof_dir: Path
+    storage_backend: str = 'local'
+    modal_worker_app: str = 'landlord-db-worker-test'
+    modal_dataset: str = 'production'
 
     @classmethod
     def from_env(cls, *, require_token: bool = True) -> "Settings":
         load_dotenv(PROJECT_ROOT / ".env")
 
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        storage_backend = os.getenv('STORAGE_BACKEND', 'local').strip().lower()
+        if storage_backend not in {'local', 'modal'}:
+            raise ValueError('STORAGE_BACKEND must be local or modal')
         if require_token and not token:
             raise ValueError("TELEGRAM_BOT_TOKEN is missing from .env")
 
@@ -81,5 +87,8 @@ class Settings:
             ),
             database_path=database_path,
             payment_proof_dir=payment_proof_dir,
+            storage_backend=storage_backend,
+            modal_worker_app=os.getenv('MODAL_WORKER_APP', 'landlord-db-worker-test'),
+            modal_dataset=os.getenv('MODAL_DATASET', 'production'),
         )
 

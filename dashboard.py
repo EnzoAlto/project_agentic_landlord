@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
+import os
 
 import streamlit as st
 
@@ -14,6 +15,7 @@ from app.database import Database
 from app.maintenance import MaintenanceService, VALID_STATUSES
 from app.payments import PaymentService, PaymentSubmission
 from app.reminders import ReminderService
+from app.proof_cleanup import cleanup_reviewed_proofs
 
 
 PAYMENT_STATUS_LABELS = {
@@ -97,11 +99,16 @@ def _render_payment_review(
         image_column, review_column = st.columns([1, 1.25], gap="large")
 
         with image_column:
-            proof_path = _safe_proof_path(submission.proof_path, proof_root)
-            if proof_path:
-                st.image(str(proof_path), caption="Submitted payment proof")
+            store = getattr(payments, 'store', None)
+            proof = (store.proof_bytes(submission.id) if store else
+                     _safe_proof_path(submission.proof_path, proof_root))
+            if proof:
+                st.image(proof if isinstance(proof, bytes) else str(proof), caption="Submitted payment proof")
             else:
-                st.info("No locally available screenshot for this submission.")
+                if submission.status == 'needs_information' and not submission.proof_path:
+                    st.info("Screenshot removed after review. Awaiting a replacement screenshot.")
+                else:
+                    st.info("No locally available screenshot for this submission.")
             st.markdown(f"**Group:** {submission.group_title}")
             st.markdown(
                 f"**Submitted by:** {submission.submitter_name or 'Unknown'}"
@@ -175,7 +182,7 @@ def _render_payment_review(
                 "Mark fully paid",
                 type="primary",
                 width="stretch",
-                disabled=selected_bill is None,
+                disabled=selected_bill is None or submission.status != 'pending_review',
                 key=f"fully_paid_{submission.id}",
             ):
                 result = billing.apply_payment(
@@ -210,7 +217,7 @@ def _render_payment_review(
             if amount_column.button(
                 "Record entered amount",
                 width="stretch",
-                disabled=selected_bill is None,
+                disabled=selected_bill is None or submission.status != 'pending_review',
                 key=f"record_amount_{submission.id}",
             ):
                 result = billing.apply_payment(
@@ -429,7 +436,9 @@ def _render_billing_setup(billing: BillingService) -> None:
         )
     st.caption('Sends a payment reminder to all Residents')
     if alert_clicked:
-        count = ReminderService(billing.database).queue_reminders(test=True)
+        store = getattr(billing, 'store', None)
+        count = (store.queue_reminders(test=True) if store else
+                 ReminderService(billing.database).queue_reminders(test=True))
         st.success(f'{count} test reminder(s) queued for Telegram delivery.')
     if save_clicked:
         records = []
@@ -478,6 +487,8 @@ def _render_payments(
     billing: BillingService,
     proof_root: Path,
 ) -> None:
+    if not getattr(billing, 'store', None):
+        cleanup_reviewed_proofs(billing.database, proof_root)
     review_tab, ledger_tab, setup_tab, history_tab = st.tabs(
         ["Review queue", "Monthly ledger", "Billing setup", "Submission history"]
     )
@@ -569,15 +580,33 @@ def main() -> None:
     st.set_page_config(
         page_title="Landlord Operations", page_icon="🏠", layout="wide"
     )
+    # Read only named top-level secrets. Never bundle a Modal token in GitHub.
+    try:
+        for key in ('STORAGE_BACKEND', 'MODAL_WORKER_APP', 'MODAL_DATASET',
+                    'MODAL_TOKEN_ID', 'MODAL_TOKEN_SECRET'):
+            if key in st.secrets:
+                os.environ[key] = str(st.secrets[key])
+    except FileNotFoundError:
+        pass
     settings = Settings.from_env(require_token=False)
-    database = Database(settings.database_path)
-    database.initialize()
-    payments = PaymentService(database)
-    billing = BillingService(database)
-    maintenance = MaintenanceService(database)
+    if settings.storage_backend == 'modal':
+        from app.remote_services import (
+            ModalStore, RemoteBillingService, RemotePaymentService, RemoteMaintenanceService,
+        )
+        store = ModalStore(settings.modal_worker_app, settings.modal_dataset,
+                           st.session_state.setdefault('modal_pending_writes', {}))
+        payments = RemotePaymentService(store)
+        billing = RemoteBillingService(store)
+        maintenance = RemoteMaintenanceService(store)
+    else:
+        database = Database(settings.database_path)
+        database.initialize()
+        payments = PaymentService(database)
+        billing = BillingService(database)
+        maintenance = MaintenanceService(database)
 
     st.title("Landlord operations")
-    st.caption("Local review dashboard for Telegram payments and maintenance")
+    st.caption(f"{'Modal shared storage' if settings.storage_backend == 'modal' else 'Local SQLite'} · Telegram payments and maintenance")
     payments_tab, maintenance_tab = st.tabs(
         ["Payment requests", "Maintenance requests"]
     )

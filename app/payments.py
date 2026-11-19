@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 
 from app.database import Database
+from app.proof_cleanup import queue_proof_cleanup, cleanup_reviewed_proofs
 
 
 REVIEW_STATUSES = {"approved", "rejected", "needs_information"}
@@ -71,8 +72,9 @@ def _submission_from_row(row) -> PaymentSubmission:  # type: ignore[no-untyped-d
 
 
 class PaymentService:
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, *, cleanup_proofs: bool = True):
         self.database = database
+        self.cleanup_proofs = cleanup_proofs
 
     @staticmethod
     def _select_sql() -> str:
@@ -297,8 +299,12 @@ class PaymentService:
                 (current["group_chat_id"], notification),
             )
 
+            queue_proof_cleanup(connection, current)
+
             row = connection.execute(
                 self._select_sql() + " WHERE p.id = ?", (submission_id,)
             ).fetchone()
-        return _submission_from_row(row)
+        if self.cleanup_proofs:
+            cleanup_reviewed_proofs(self.database)
+        return self.get(submission_id)
 
