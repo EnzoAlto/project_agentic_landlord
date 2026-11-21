@@ -12,4 +12,5 @@ data/payment_proofs/
 .streamlit/secrets.toml
 data/modal_import/
 data/backups/
+research/
 

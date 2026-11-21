@@ -36,6 +36,21 @@ DEFAULT_UNITS = (
 
 
 BASE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS telegram_cloud_runtime (
+    bot_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1))
+);
+CREATE TABLE IF NOT EXISTS telegram_inbox (
+    bot_id INTEGER NOT NULL,
+    update_id INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    retry_after TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(bot_id, update_id)
+);
 CREATE TABLE IF NOT EXISTS payment_proof_cleanup (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     submission_id INTEGER NOT NULL,

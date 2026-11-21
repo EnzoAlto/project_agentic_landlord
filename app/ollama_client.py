@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import re
 from typing import Any
 
 import requests
@@ -11,6 +12,10 @@ import requests
 
 class OllamaResponseError(RuntimeError):
     """Raised when Ollama returns an unusable response."""
+
+
+class AssistantUnavailableError(OllamaResponseError):
+    """Cloud commands are available while model inference is not configured."""
 
 
 @dataclass(frozen=True)
@@ -161,6 +166,13 @@ Do not invent details.
             content = response.json()["message"]["content"].strip()
         except (KeyError, TypeError, AttributeError) as exc:
             raise OllamaResponseError("Ollama returned no message content") from exc
+        # Some model templates leak thinking tags into content even with think=False.
+        # Keep only the final answer, including when the opening tag is missing.
+        content = re.sub(r"<think\s*>.*?</think\s*>", "", content,
+                         flags=re.IGNORECASE | re.DOTALL)
+        content = re.split(r"</think\s*>", content, flags=re.IGNORECASE)[-1]
+        # An unfinished thinking block contains no usable final answer.
+        content = re.split(r"<think\s*>", content, flags=re.IGNORECASE)[0].strip()
         if not content:
             raise OllamaResponseError("Ollama returned an empty response")
         return content

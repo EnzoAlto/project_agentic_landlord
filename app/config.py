@@ -46,6 +46,8 @@ class Settings:
     storage_backend: str = 'local'
     modal_worker_app: str = 'landlord-db-worker-test'
     modal_dataset: str = 'production'
+    ai_backend: str = 'ollama'
+    modal_qwen_app: str = 'landlord-qwen'
 
     @classmethod
     def from_env(cls, *, require_token: bool = True) -> "Settings":
@@ -53,6 +55,9 @@ class Settings:
 
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         storage_backend = os.getenv('STORAGE_BACKEND', 'local').strip().lower()
+        ai_backend = os.getenv('AI_BACKEND', 'ollama').strip().lower()
+        if ai_backend not in {'ollama', 'modal'}:
+            raise ValueError('AI_BACKEND must be ollama or modal')
         if storage_backend not in {'local', 'modal'}:
             raise ValueError('STORAGE_BACKEND must be local or modal')
         if require_token and not token:
@@ -90,5 +95,7 @@ class Settings:
             storage_backend=storage_backend,
             modal_worker_app=os.getenv('MODAL_WORKER_APP', 'landlord-db-worker-test'),
             modal_dataset=os.getenv('MODAL_DATASET', 'production'),
+            ai_backend=ai_backend,
+            modal_qwen_app=os.getenv('MODAL_QWEN_APP', 'landlord-qwen'),
         )
 

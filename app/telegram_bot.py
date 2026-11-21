@@ -8,17 +8,20 @@ from uuid import uuid4
 from pathlib import Path
 import re
 import time
-from typing import Protocol
+import tempfile
+from threading import Timer
+from typing import Callable, Protocol, TypeVar
 
 import requests
 
 from app.database import Database
 from app.maintenance import MaintenanceService
-from app.ollama_client import IntentResult, OllamaResponseError
+from app.ollama_client import IntentResult, OllamaResponseError, AssistantUnavailableError
 from app.payments import PaymentService
 from app.reminders import ReminderService
 from app.payment_history import PAYMENT_HISTORY_PROMPT, group_payment_context
 from app.proof_cleanup import cleanup_reviewed_proofs
+from app.remote_services import RemoteStorageError
 
 
 class TelegramAPIError(RuntimeError):
@@ -31,6 +34,42 @@ class TelegramTransport(Protocol):
     def send_message(self, chat_id: int, text: str) -> dict: ...
 
     def download_file(self, file_id: str, destination: Path) -> Path: ...
+
+
+_Result = TypeVar('_Result')
+
+
+class _AIWaitNotice:
+    """One delay notice per incoming message, counting time spent awaiting AI."""
+
+    def __init__(self, telegram: TelegramTransport, chat_id: int):
+        self.telegram = telegram
+        self.chat_id = chat_id
+        self.elapsed = 0.0
+        self.attempted = False
+
+    def _send(self) -> None:
+        self.attempted = True
+        try:
+            self.telegram.send_message(self.chat_id, 'Hello! reading your message')
+        except Exception as exc:
+            # A failed progress notice must not prevent the actual response.
+            print(f'AI delay notice failed: {type(exc).__name__}')
+
+    def call(self, function: Callable[..., _Result], *args) -> _Result:
+        if self.attempted:
+            return function(*args)
+        timer = Timer(max(0.0, 8.0 - self.elapsed), self._send)
+        timer.daemon = True
+        started = time.monotonic()
+        timer.start()
+        try:
+            return function(*args)
+        finally:
+            self.elapsed += time.monotonic() - started
+            timer.cancel()
+            # Finish an already-started notice before sending the final reply.
+            timer.join()
 
 
 class AssistantClient(Protocol):
@@ -62,7 +101,7 @@ class TelegramClient:
             suffix = f" HTTP {status}" if status else ""
             raise TelegramAPIError(
                 f"Telegram {method} request failed{suffix}"
-            ) from exc
+            ) from None
 
         result = response.json()
         if not result.get("ok"):
@@ -74,6 +113,9 @@ class TelegramClient:
 
     def get_me(self) -> dict:
         return self._call("getMe")
+
+    def get_webhook_info(self) -> dict:
+        return self._call('getWebhookInfo')
 
     def get_updates(self, offset: int | None = None) -> list[dict]:
         payload = {"timeout": 25, "allowed_updates": ["message"]}
@@ -105,7 +147,7 @@ class TelegramClient:
             )
             response.raise_for_status()
         except requests.RequestException as exc:
-            raise TelegramAPIError("Telegram file download failed") from exc
+            raise TelegramAPIError("Telegram file download failed") from None
 
         destination.write_bytes(response.content)
         return destination
@@ -255,15 +297,26 @@ class LandlordBot:
             )
             return True
 
-        destination = self.proof_dir / f"payment_{submission.id}_{uuid4().hex}{suffix}"
-        self.telegram.download_file(file_id, destination)
-        updated = self.payments.attach_proof(
-            submission_id=submission.id,
-            proof_message_id=int(message.get("message_id", 0)),
-            telegram_file_id=file_id,
-            proof_path=str(destination),
-            caption=message.get("caption"),
-        )
+        if hasattr(self.payments, 'upload_proof'):
+            with tempfile.TemporaryDirectory(prefix='telegram-proof-') as temporary:
+                destination = Path(temporary) / f'proof{suffix}'
+                self.telegram.download_file(file_id, destination)
+                updated = self.payments.upload_proof(
+                    path=destination, chat_id=chat_id, sender_id=sender_id,
+                    submission_id=submission.id,
+                    proof_message_id=int(message.get('message_id', 0)),
+                    telegram_file_id=file_id, caption=message.get('caption'),
+                )
+        else:
+            destination = self.proof_dir / f"payment_{submission.id}_{uuid4().hex}{suffix}"
+            self.telegram.download_file(file_id, destination)
+            updated = self.payments.attach_proof(
+                submission_id=submission.id,
+                proof_message_id=int(message.get("message_id", 0)),
+                telegram_file_id=file_id,
+                proof_path=str(destination),
+                caption=message.get("caption"),
+            )
         self.telegram.send_message(
             chat_id,
             f"Payment proof #{updated.id} was submitted.\n"
@@ -271,9 +324,14 @@ class LandlordBot:
         )
         return True
 
-    def _reply_with_payment_history(self, chat_id: int, question: str) -> None:
-        context = group_payment_context(self.database, chat_id)
-        reply = self.assistant.chat([
+    def _reply_with_payment_history(
+        self, chat_id: int, question: str, notice: _AIWaitNotice | None = None,
+    ) -> None:
+        context = (self.database.payment_context(chat_id)
+                   if hasattr(self.database, 'payment_context')
+                   else group_payment_context(self.database, chat_id))
+        notice = notice or _AIWaitNotice(self.telegram, chat_id)
+        reply = notice.call(self.assistant.chat, [
             {'role': 'system', 'content': PAYMENT_HISTORY_PROMPT},
             {'role': 'user', 'content': json.dumps({
                 'question': question, 'authorized_records': context,
@@ -349,15 +407,28 @@ class LandlordBot:
 
             cleaned = self._clean_text(text)
             command = cleaned.split(maxsplit=1)[0].lower() if cleaned else ""
+            notice = _AIWaitNotice(self.telegram, chat_id)
 
             if command in {"/start", "/help"}:
                 self.telegram.send_message(
                     chat_id,
                     "Mention me with a maintenance or payment request.\n"
-                    "Commands: /tickets, /payment, /payments, /reset",
+                    "Commands: /tickets, /maintenance <issue>, /payment, /payments, /reset",
                 )
+            elif command == '/maintenance':
+                description = cleaned[len(command):].strip()
+                if not description:
+                    self.telegram.send_message(chat_id, 'Use /maintenance followed by the issue, for example: /maintenance leaking sink')
+                else:
+                    ticket = self.maintenance.create_ticket(
+                        group_chat_id=chat_id,
+                        submitter_user_id=sender_id if isinstance(sender_id, int) else None,
+                        submitter_name=sender_name, description=description,
+                        telegram_update_id=update_id,
+                    )
+                    self.telegram.send_message(chat_id, f'Maintenance ticket #{ticket.id} created. Status: {ticket.status}')
             elif command == "/payments":
-                self._reply_with_payment_history(chat_id, 'Show our payment history.')
+                self._reply_with_payment_history(chat_id, 'Show our payment history.', notice)
             elif command == "/reset":
                 self.conversation_history.pop(chat_id, None)
                 self.telegram.send_message(chat_id, "Conversation memory cleared.")
@@ -395,7 +466,7 @@ class LandlordBot:
                     "Please include a request after mentioning the bot.",
                 )
             else:
-                intent = self.assistant.classify_message(cleaned)
+                intent = notice.call(self.assistant.classify_message, cleaned)
                 print(f"Classified update {update_id} as {intent.intent}")
                 if intent.intent == "maintenance_request":
                     ticket = self.maintenance.create_ticket(
@@ -426,12 +497,12 @@ class LandlordBot:
                         intent=intent,
                     )
                 elif intent.intent in {"payment_history", "balance_inquiry", "billing_question"}:
-                    self._reply_with_payment_history(chat_id, cleaned)
+                    self._reply_with_payment_history(chat_id, cleaned, notice)
                 else:
                     history = self.conversation_history[chat_id]
                     history.append({"role": "user", "content": cleaned})
                     history[:] = history[-12:]
-                    reply = self.assistant.chat(
+                    reply = notice.call(self.assistant.chat,
                         [
                             {
                                 "role": "system",
@@ -447,6 +518,10 @@ class LandlordBot:
                     history.append({"role": "assistant", "content": reply})
                     history[:] = history[-12:]
                     self.telegram.send_message(chat_id, reply)
+        except AssistantUnavailableError:
+            self.telegram.send_message(chat_id,
+                'AI replies are temporarily unavailable. Use /payment to send proof, '
+                '/payments for history, /maintenance followed by your issue, or /tickets.')
         except (OllamaResponseError, TelegramAPIError, ValueError) as exc:
             print(f"Request error for update {update_id}: {exc}")
             self.telegram.send_message(
@@ -470,20 +545,23 @@ class LandlordBot:
         print("Landlord Telegram bot is online. Press Ctrl+C to stop.")
         while True:
             try:
-                cleanup_reviewed_proofs(self.database, self.proof_dir)
-                ReminderService(self.database).queue_reminders()
+                if hasattr(self.database, 'queue_reminders'):
+                    self.database.queue_reminders()
+                else:
+                    cleanup_reviewed_proofs(self.database, self.proof_dir)
+                    ReminderService(self.database).queue_reminders()
                 self.flush_outbox()
                 updates = self.telegram.get_updates(offset)
                 for update in updates:
                     update_id = update.get("update_id")
+                    self.handle_update(update)
                     if isinstance(update_id, int):
                         offset = update_id + 1
-                    self.handle_update(update)
                 self.flush_outbox()
             except KeyboardInterrupt:
                 print("\nBot stopped.")
                 return
-            except (requests.RequestException, TelegramAPIError) as exc:
+            except (requests.RequestException, TelegramAPIError, RemoteStorageError) as exc:
                 print(f"Telegram connection error: {exc}")
                 time.sleep(3)
 

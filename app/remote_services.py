@@ -10,6 +10,10 @@ from app.maintenance import MaintenanceTicket
 from app.payments import PaymentSubmission
 
 
+class RemoteStorageError(RuntimeError):
+    """A cloud job could not be confirmed; preserve its ID when retrying."""
+
+
 class ModalStore:
     def __init__(self, app_name: str, dataset: str, pending_writes: dict):
         import modal
@@ -18,13 +22,13 @@ class ModalStore:
         self.pending_writes = pending_writes
         self._state = None
 
-    def call(self, operation: str, payload: dict | None = None, *, write: bool = False):
+    def call(self, operation: str, payload: dict | None = None, *, write: bool = False,
+             request_id: str | None = None):
         payload = {} if payload is None else payload
         # Preserve the same ID across uncertain retries and Streamlit reruns.
         key = json.dumps([self.dataset, operation, payload], sort_keys=True, allow_nan=False)
-        request_id = None
         if write:
-            request_id = self.pending_writes.setdefault(key, str(uuid4()))
+            request_id = self.pending_writes.setdefault(key, request_id or str(uuid4()))
         last_error = None
         for attempt in range(2):
             try:
@@ -45,7 +49,7 @@ class ModalStore:
                 last_error = exc
                 if attempt == 0:
                     time.sleep(1)
-        raise RuntimeError(
+        raise RemoteStorageError(
             'Modal request could not be confirmed. Retry the same action without '
             'changing its inputs; the request ID is retained in this session.'
         ) from last_error
@@ -62,6 +66,37 @@ class ModalStore:
 
     def queue_reminders(self, *, test: bool = False) -> int:
         return self.call('queue_reminders', {'test': test}, write=True)
+
+
+class RemoteBotDatabase:
+    """Only explicit operations are available; no remote SQL connection."""
+    def __init__(self, store: ModalStore):
+        self.store = store
+
+    def is_update_processed(self, update_id):
+        return self.store.call('is_update_processed', {'update_id': update_id})
+
+    def mark_update_processed(self, update_id):
+        return self.store.call('mark_update_processed', {'update_id': update_id}, write=True)
+
+    def upsert_group(self, chat_id, title, chat_type):
+        return self.store.call('register_group', dict(chat_id=chat_id, title=title,
+                                                     chat_type=chat_type), write=True)
+
+    def pending_outbox(self):
+        return self.store.call('pending_outbox')
+
+    def mark_outbox_sent(self, outbox_id):
+        return self.store.call('mark_outbox_sent', {'outbox_id': outbox_id}, write=True)
+
+    def mark_outbox_failed(self, outbox_id, error):
+        return self.store.call('mark_outbox_failed', dict(outbox_id=outbox_id, error=error), write=True)
+
+    def payment_context(self, chat_id):
+        return self.store.call('payment_history', {'chat_id': chat_id})
+
+    def queue_reminders(self):
+        return self.store.queue_reminders()
 
 class RemoteBillingService:
     def __init__(self, store: ModalStore):
@@ -112,6 +147,29 @@ class RemotePaymentService:
         row = self.store.call('review_payment', payload, write=True)
         return PaymentSubmission(**{**row, 'categories': tuple(row['categories'])})
 
+    @staticmethod
+    def _submission(row):
+        return PaymentSubmission(**{**row, 'categories': tuple(row['categories'])}) if row else None
+
+    def create_request(self, **payload):
+        payload = {**payload, 'categories': list(payload.get('categories', []))}
+        return self._submission(self.store.call('create_payment_request', payload, write=True))
+
+    def set_request_message(self, submission_id, request_message_id):
+        return self.store.call('set_request_message', dict(submission_id=submission_id,
+            request_message_id=request_message_id), write=True)
+
+    def find_awaiting_proof(self, **payload):
+        return self._submission(self.store.call('find_awaiting_proof', payload))
+
+    def upload_proof(self, *, path, chat_id, sender_id, **payload):
+        if path.stat().st_size > 20 * 1024 * 1024:
+            raise ValueError('Screenshot is larger than 20 MiB')
+        payload = {**payload, 'chat_id': chat_id, 'sender_id': sender_id,
+                   'suffix': path.suffix, 'data_b64': base64.b64encode(path.read_bytes()).decode()}
+        return self._submission(self.store.call('upload_proof', payload, write=True,
+            request_id=f"proof-{payload['submission_id']}-{payload['proof_message_id']}"))
+
 
 class RemoteMaintenanceService:
     def __init__(self, store: ModalStore):
@@ -119,6 +177,13 @@ class RemoteMaintenanceService:
 
     def list_all(self):
         return [MaintenanceTicket(**row) for row in self.store.state['maintenance']]
+
+    def create_ticket(self, **payload):
+        return MaintenanceTicket(**self.store.call('create_maintenance', payload, write=True))
+
+    def list_for_group(self, group_chat_id):
+        return [MaintenanceTicket(**row) for row in self.store.call('group_maintenance',
+            {'group_chat_id': group_chat_id})]
 
     def update_status(self, ticket_id, status, *, notify_group=False):
         return MaintenanceTicket(**self.store.call('set_maintenance_status', dict(
