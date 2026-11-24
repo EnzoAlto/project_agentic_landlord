@@ -87,7 +87,7 @@ def remove_old_model():
 
 @app.cls(image=image, volumes={MODEL_DIR: weights}, gpu='T4', cpu=1,
          memory=4096, min_containers=0, max_containers=1,
-         scaledown_window=30, timeout=420)
+         scaledown_window=60, timeout=420)
 class Qwen:
     @modal.enter()
     def load(self):

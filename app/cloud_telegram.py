@@ -12,7 +12,7 @@ from app.telegram_bot import LandlordBot, TelegramClient
 
 
 class CommandOnlyAssistant:
-    def classify_message(self, text):
+    def classify_message(self, text, *, reference_date=None):
         raise AssistantUnavailableError('Remote inference has not been configured')
 
     def chat(self, messages):

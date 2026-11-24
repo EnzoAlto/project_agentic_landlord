@@ -39,6 +39,9 @@ class PaymentSubmission:
     review_note: str | None
     created_at: str
     reviewed_at: str | None
+    resident_notes: str | None = None
+    claim_lines: tuple[dict, ...] = ()
+    previous_approved_amount_cents: int | None = None
 
 
 def _submission_from_row(row) -> PaymentSubmission:  # type: ignore[no-untyped-def]
@@ -68,6 +71,9 @@ def _submission_from_row(row) -> PaymentSubmission:  # type: ignore[no-untyped-d
         review_note=row["review_note"],
         created_at=row["created_at"],
         reviewed_at=row["reviewed_at"],
+        resident_notes=row["resident_notes"],
+        claim_lines=tuple(json.loads(row["claim_lines_json"] or '[]')),
+        previous_approved_amount_cents=row["previous_approved_amount_cents"],
     )
 
 
@@ -79,7 +85,12 @@ class PaymentService:
     @staticmethod
     def _select_sql() -> str:
         return """
-            SELECT p.*, g.title AS group_title
+            SELECT p.*, g.title AS group_title,
+                (SELECT json_extract(a.details_json, '$.previous_approval.amount_received_cents')
+                 FROM audit_events AS a
+                 WHERE a.entity_type = 'payment_submission' AND a.entity_id = p.id
+                   AND a.action = 'approval_undone'
+                 ORDER BY a.id DESC LIMIT 1) AS previous_approved_amount_cents
             FROM payment_submissions AS p
             LEFT JOIN telegram_groups AS g
                 ON g.chat_id = p.group_chat_id
@@ -96,6 +107,8 @@ class PaymentService:
         categories: tuple[str, ...] = (),
         billing_period: str | None = None,
         amount_claimed: str | None = None,
+        resident_notes: str | None = None,
+        claim_lines: list[dict] | tuple[dict, ...] = (),
     ) -> PaymentSubmission:
         with self.database.connection() as connection:
             existing = connection.execute(
@@ -110,8 +123,8 @@ class PaymentService:
                 INSERT INTO payment_submissions(
                     group_chat_id, submitter_user_id, submitter_name,
                     source_update_id, summary, categories_json,
-                    billing_period, amount_claimed
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    billing_period, amount_claimed, resident_notes, claim_lines_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     group_chat_id,
@@ -122,6 +135,8 @@ class PaymentService:
                     json.dumps(list(categories)),
                     billing_period,
                     amount_claimed,
+                    resident_notes,
+                    json.dumps(list(claim_lines)),
                 ),
             )
             row = connection.execute(
@@ -129,6 +144,10 @@ class PaymentService:
                 (cursor.lastrowid,),
             ).fetchone()
         return _submission_from_row(row)
+
+    def quote(self, group_chat_id: int, claim_lines: list[dict], amount_claimed=None) -> str:
+        from app.billing import BillingService
+        return BillingService(self.database).payment_quote(group_chat_id, claim_lines, amount_claimed)
 
     def set_request_message(
         self, submission_id: int, request_message_id: int

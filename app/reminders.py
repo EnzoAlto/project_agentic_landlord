@@ -52,8 +52,9 @@ class ReminderService:
                         f"Account: {bill['resident_name']}\n"
                         f"Billing month: {period}\nDue: {bill['due_date']}\n"
                         f"Rent + parking: {format_peso(bill['rent_parking_cents'])}\n"
-                        f"Water: {format_peso(bill['water_bill_cents'])}\n"
-                        f"Electricity: {format_peso(bill['electricity_bill_cents'])}\n"
+                        f"Water: {format_peso(bill['water_bill_cents']) if bill['water_entered'] else 'Not yet billed'}\n"
+                        f"Electricity: {format_peso(bill['electricity_bill_cents']) if bill['electricity_entered'] else 'Not yet billed'}\n"
+                        f"Others Bill: {format_peso(bill['others_bill_cents'])}\n"
                         f"Paid / credited: {format_peso(bill['allocated_cents'])}\n"
                         f"Outstanding: {format_peso(remaining)}\n"
                         'Please mention the bot or use /payment to submit payment proof.'

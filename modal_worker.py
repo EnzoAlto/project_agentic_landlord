@@ -28,7 +28,9 @@ image = (modal.Image.debian_slim(python_version='3.12')
     retries=modal.Retries(max_retries=2, initial_delay=1.0),
 )
 def database_job(operation: str, payload: dict | None = None,
-                 request_id: str | None = None, dataset: str = 'worker-test') -> dict:
+                 request_id: str | None = None, dataset: str = 'worker-test',
+                 include_claim_details: bool = False,
+                 include_others_bill: bool = False) -> dict:
     # Synchronous function, no @modal.concurrent: one input at a time.
     from app.modal_storage import SnapshotWorker
 
@@ -44,4 +46,18 @@ def database_job(operation: str, payload: dict | None = None,
         except Exception as exc:
             # Notification failure cannot roll back a successfully saved proof.
             print(f'Proof saved; dashboard signal unavailable: {type(exc).__name__}')
+    if not include_claim_details or not include_others_bill:
+        # Independently deployed clients may still use older dataclasses.
+        excluded = set()
+        if not include_claim_details:
+            excluded.update({'resident_notes', 'claim_lines', 'previous_approved_amount_cents'})
+        if not include_others_bill:
+            excluded.add('others_bill_cents')
+        def legacy(value):
+            if isinstance(value, dict):
+                return {k: legacy(v) for k, v in value.items() if k not in excluded}
+            if isinstance(value, (list, tuple)):
+                return [legacy(v) for v in value]
+            return value
+        return legacy(result)
     return result

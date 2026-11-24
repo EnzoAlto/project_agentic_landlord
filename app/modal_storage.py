@@ -28,7 +28,7 @@ READ_OPERATIONS = {
     'health', 'list_units', 'list_groups', 'list_bills',
     'list_payments', 'payment_history', 'list_maintenance', 'dashboard_state', 'read_proof',
     'is_update_processed', 'pending_outbox', 'find_awaiting_proof', 'get_payment',
-    'group_maintenance',
+    'group_maintenance', 'payment_quote',
     'cloud_bot_runtime', 'next_telegram_update',
 }
 WRITE_OPERATIONS = {
@@ -37,7 +37,7 @@ WRITE_OPERATIONS = {
     'mark_update_processed', 'mark_outbox_sent', 'mark_outbox_failed',
     'create_payment_request', 'set_request_message', 'upload_proof',
     'set_cloud_bot_runtime', 'enqueue_telegram_update', 'finish_telegram_update',
-    'fail_telegram_update',
+    'fail_telegram_update', 'record_advance', 'create_due_bills', 'undo_approval',
 }
 
 
@@ -45,6 +45,14 @@ def _dispatch(database: Database, operation: str, payload: dict) -> object:
     billing = BillingService(database, cleanup_proofs=False)
     maintenance = MaintenanceService(database)
     payments = PaymentService(database, cleanup_proofs=False)
+    if operation == 'undo_approval':
+        return billing.undo_approval(**payload)
+    if operation == 'payment_quote':
+        return billing.payment_quote(**payload)
+    if operation == 'create_due_bills':
+        return billing.create_due_bills()
+    if operation == 'record_advance':
+        return asdict(billing.record_advance(**payload))
     if operation == 'cloud_bot_runtime':
         with database.connection() as connection:
             row = connection.execute('SELECT enabled FROM telegram_cloud_runtime WHERE bot_id = ?',
@@ -255,7 +263,8 @@ class SnapshotWorker:
             encoded = json.dumps(result, allow_nan=False)
             # An idle reminder check makes no changes and needs no receipt or
             # new snapshot. Avoid thousands of identical backups each day.
-            no_change = operation == 'queue_reminders' and result == 0
+            no_change = ((operation == 'queue_reminders' and result == 0)
+                         or (operation == 'create_due_bills' and not result['changed']))
             if writing and not no_change:
                 with database.connection() as connection:
                     connection.execute('INSERT INTO worker_requests VALUES (?, ?, ?, CURRENT_TIMESTAMP)',

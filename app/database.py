@@ -36,6 +36,10 @@ DEFAULT_UNITS = (
 
 
 BASE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS billing_schedule_runs (
+    billing_period TEXT PRIMARY KEY,
+    last_checked_date TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS telegram_cloud_runtime (
     bot_id INTEGER PRIMARY KEY,
     enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1))
@@ -181,6 +185,7 @@ CREATE TABLE IF NOT EXISTS monthly_bills (
     electricity_present REAL,
     electricity_difference REAL,
     electricity_bill_cents INTEGER NOT NULL DEFAULT 0,
+    others_bill_cents INTEGER NOT NULL DEFAULT 0,
     total_due_cents INTEGER NOT NULL,
     notes TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -279,6 +284,8 @@ class Database:
             for name in ('water_entered', 'electricity_entered'):
                 if name not in columns:
                     connection.execute(f'ALTER TABLE monthly_bills ADD COLUMN {name} INTEGER NOT NULL DEFAULT 1')
+            if 'others_bill_cents' not in columns:
+                connection.execute('ALTER TABLE monthly_bills ADD COLUMN others_bill_cents INTEGER NOT NULL DEFAULT 0')
             connection.executescript(INDEX_SCHEMA)
 
     @staticmethod
@@ -387,6 +394,8 @@ class Database:
         }
         columns = {
             "bill_id": "INTEGER",
+            "resident_notes": "TEXT",
+            "claim_lines_json": "TEXT NOT NULL DEFAULT '[]'",
             "amount_received_cents": "INTEGER",
             "applied_amount_cents": "INTEGER",
             "credit_amount_cents": "INTEGER",

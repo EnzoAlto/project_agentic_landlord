@@ -93,6 +93,7 @@ def process_inbox():
                        'error': type(exc).__name__}, write=True)
             print(f"Update {update['update_id']} deferred: {type(exc).__name__}")
             break
+    store.create_due_bills()
     store.queue_reminders()
     bot.flush_outbox()
     return {'active': True}

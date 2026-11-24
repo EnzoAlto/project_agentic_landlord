@@ -1,6 +1,7 @@
 """Dashboard service adapters; all cloud operations use the single Modal worker."""
 
 import base64
+from dataclasses import fields
 import json
 import time
 from uuid import uuid4
@@ -34,7 +35,8 @@ class ModalStore:
         for attempt in range(2):
             try:
                 response = self.worker.remote(operation, payload, request_id=request_id,
-                                              dataset=self.dataset)
+                                              dataset=self.dataset, include_claim_details=True,
+                                              include_others_bill=True)
                 if not response.get('ok'):
                     raise RuntimeError('Database worker did not confirm the request')
                 if write:
@@ -67,6 +69,9 @@ class ModalStore:
 
     def queue_reminders(self, *, test: bool = False) -> int:
         return self.call('queue_reminders', {'test': test}, write=True)
+
+    def create_due_bills(self):
+        return self.call('create_due_bills', write=True)
 
 
 class RemoteBotDatabase:
@@ -134,27 +139,44 @@ class RemoteBillingService:
     def apply_payment(self, **payload):
         return PaymentApplication(**self.store.call('apply_payment', payload, write=True))
 
+    def record_advance(self, **payload):
+        return PaymentApplication(**self.store.call('record_advance', payload, write=True))
+
+    def undo_approval(self, submission_id):
+        return self.store.call('undo_approval', {'submission_id': submission_id}, write=True)
+
 
 class RemotePaymentService:
     def __init__(self, store: ModalStore):
         self.store = store
 
     def list_submissions(self, statuses=None):
-        return [PaymentSubmission(**{**row, 'categories': tuple(row['categories'])})
+        return [self._submission(row)
                 for row in self.store.state['payments']
                 if not statuses or row['status'] in statuses]
 
     def review(self, **payload):
         row = self.store.call('review_payment', payload, write=True)
-        return PaymentSubmission(**{**row, 'categories': tuple(row['categories'])})
+        return self._submission(row)
 
     @staticmethod
     def _submission(row):
-        return PaymentSubmission(**{**row, 'categories': tuple(row['categories'])}) if row else None
+        if row is None:
+            return None
+        # Worker and clients deploy independently. Ignore fields added by a
+        # newer worker until this client's PaymentSubmission supports them.
+        supported = {field.name for field in fields(PaymentSubmission)}
+        values = {key: value for key, value in row.items() if key in supported}
+        values['categories'] = tuple(row['categories'])
+        return PaymentSubmission(**values)
 
     def create_request(self, **payload):
         payload = {**payload, 'categories': list(payload.get('categories', []))}
         return self._submission(self.store.call('create_payment_request', payload, write=True))
+
+    def quote(self, group_chat_id, claim_lines, amount_claimed=None):
+        return self.store.call('payment_quote', {'group_chat_id': group_chat_id, 'claim_lines': claim_lines,
+                                               'amount_claimed': amount_claimed})
 
     def set_request_message(self, submission_id, request_message_id):
         return self.store.call('set_request_message', dict(submission_id=submission_id,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 import json
 import re
 from typing import Any
@@ -27,6 +28,7 @@ class IntentResult:
     billing_period: str | None = None
     amount_claimed: str | None = None
     requires_attachment: bool = False
+    payment_items: tuple[dict, ...] = ()
 
 
 class OllamaClient:
@@ -50,19 +52,33 @@ class OllamaClient:
             if model.get("name")
         ]
 
-    def classify_message(self, text: str) -> IntentResult:
+    def classify_message(self, text: str, *, reference_date: str | None = None) -> IntentResult:
         system_prompt = """
 Classify a resident's message for a landlord management system.
-Return JSON only with keys: intent, summary, urgency, payment_categories,
-billing_period, amount_claimed, requires_attachment.
+Return JSON only with keys: intent, urgency, payment_categories,
+payment_items, amount_claimed, requires_attachment. Do not generate a summary.
 intent must be maintenance_request, payment_submission, payment_history, balance_inquiry,
 billing_question, or general_chat.
 Use payment_history for requests to see past payments, receipts, collection dates,
 or payment approval status. A question about previous payments is not a new submission.
 urgency must be low, normal, high, or emergency.
-payment_categories must be a JSON list containing only rent, electricity,
+payment_categories must be a JSON list containing only all, rent, electricity,
 water, or other. Use an empty list when payment is unrelated.
-Use null for an unknown billing_period or amount_claimed.
+payment_items is a list of objects with category and period. Pair each charge
+with each explicitly requested month, keeping different items' months separate.
+category must be all, rent, water, electricity, or other.
+When the resident does not specify charge types, use all for each requested
+month. Never assume rent only: "pay for November and December" means all for
+both months. Explicit "rent for November and December" means rent only.
+Use YYYY-MM for explicit
+months, using reference_date for omitted years. Handle December/January rollover.
+For relative dates use this_month, next_month, or last_month; Python resolves them.
+If no month is specified for an item use this_month. If dates are ambiguous
+(e.g. "two months"), use null rather than guessing which months.
+Example in November: "November and December rent plus electricity this month"
+means rent for both months and electricity only for this_month.
+For nonpayment messages use an empty payment_items list.
+Use null for an unknown amount_claimed.
 requires_attachment must be true for payment proof submissions.
 Never approve or verify a payment.
 Do not invent details.
@@ -71,7 +87,10 @@ Do not invent details.
         content = self._chat(
             [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text},
+                {"role": "user", "content": json.dumps({
+                    "reference_date": reference_date or date.today().isoformat(),
+                    "message": text,
+                })},
             ],
             json_mode=True,
         )
@@ -79,7 +98,7 @@ Do not invent details.
         try:
             payload = json.loads(content)
             intent = str(payload["intent"]).strip().lower()
-            summary = str(payload["summary"]).strip()
+            summary = text.strip()
             urgency = str(payload.get("urgency", "normal")).strip().lower()
             raw_categories = payload.get("payment_categories", [])
             if not isinstance(raw_categories, list):
@@ -91,6 +110,14 @@ Do not invent details.
             )
             billing_period = payload.get("billing_period")
             amount_claimed = payload.get("amount_claimed")
+            payment_items = payload.get('payment_items', [])
+            if not isinstance(payment_items, list) or len(payment_items) > 48:
+                raise TypeError('payment_items must be a list of at most 48 items')
+            for item in payment_items:
+                if (not isinstance(item, dict)
+                        or item.get('category') not in {'all', 'rent', 'water', 'electricity', 'other'}
+                        or (item.get('period') is not None and not isinstance(item['period'], str))):
+                    raise TypeError('Invalid payment item')
             requires_attachment = bool(
                 payload.get("requires_attachment", False)
             )
@@ -110,7 +137,7 @@ Do not invent details.
             raise OllamaResponseError(f"Unsupported urgency: {urgency}")
         if not summary:
             raise OllamaResponseError("Ollama returned an empty summary")
-        allowed_categories = {"rent", "electricity", "water", "other"}
+        allowed_categories = {"all", "rent", "electricity", "water", "other"}
         if any(
             category not in allowed_categories
             for category in payment_categories
@@ -129,6 +156,7 @@ Do not invent details.
                 str(amount_claimed).strip() if amount_claimed else None
             ),
             requires_attachment=requires_attachment,
+            payment_items=tuple(payment_items),
         )
 
     def chat(self, messages: list[dict[str, str]]) -> str:

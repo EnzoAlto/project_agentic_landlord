@@ -17,9 +17,14 @@ rejected, and awaiting-proof submissions are not confirmed payments. Approved
 legacy proofs with no received amount must not be described as fully paid.
 Bill paid/credited amounts include applied credits. Advance credit is not a new
 payment. Unpaid older bills remain outstanding; do not infer penalties.
+General advance credit is held for the unit, not reserved for any requested
+month or item. A requested future month is never evidence that its bill is paid.
+Credit is applied only when a new bill is created; it is not automatically moved
+onto existing bills. Incomplete bills contain known charges only; utilities
+marked not entered are not yet billed, not confirmed zero charges.
 Amounts use PHP. Missing data means not recorded, not zero. The lists are limited
 to the latest 20 bills and 20 submissions; do not claim they are complete history
-or compute all-time totals from them. Mention the limit when relevant.
+or compute all-time totals from them.
 Answer concisely. If records are absent, say so. Never invent payment dates,
 amounts, receipts, or statuses. Screenshot contents have not been read by you.
 """.strip()
@@ -30,16 +35,22 @@ def group_payment_context(database: Database, chat_id: int) -> dict:
     with database.connection() as connection:
         payments = connection.execute(
             '''SELECT p.id, p.status, p.billing_period AS claimed_period,
-                      b.billing_period AS applied_period, p.created_at,
+                      (SELECT GROUP_CONCAT(periods.billing_period, ', ')
+                       FROM (SELECT DISTINCT b.billing_period
+                             FROM bill_allocations x
+                             JOIN monthly_bills b ON b.id = x.bill_id
+                             WHERE x.source_type = 'payment' AND x.source_id = p.id
+                             ORDER BY b.billing_period) AS periods) AS applied_period,
+                      p.created_at,
                       p.received_date, p.amount_received_cents,
                       p.applied_amount_cents, p.credit_amount_cents
                FROM payment_submissions p
-               LEFT JOIN monthly_bills b ON b.id = p.bill_id
                WHERE p.group_chat_id = ? ORDER BY p.id DESC LIMIT 20''',
             (chat_id,),
         ).fetchall()
         bills = connection.execute(
             '''SELECT b.billing_period, b.due_date, b.total_due_cents,
+                      b.water_entered, b.electricity_entered,
                       COALESCE((SELECT SUM(x.amount_cents) FROM bill_allocations x
                                 WHERE x.bill_id = b.id), 0) AS paid_cents
                FROM monthly_bills b JOIN units u ON u.id = b.unit_id
@@ -66,6 +77,7 @@ def group_payment_context(database: Database, chat_id: int) -> dict:
             total=format_peso(row['total_due_cents']),
             paid_or_credited=format_peso(row['paid_cents']),
             outstanding=format_peso(max(row['total_due_cents']-row['paid_cents'], 0)),
+            utilities_complete=bool(row['water_entered'] and row['electricity_entered']),
         ) for row in bills],
         'available_advance_credit': format_peso(credit),
     }

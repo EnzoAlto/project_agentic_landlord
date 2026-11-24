@@ -21,6 +21,7 @@ from app.payments import PaymentService
 from app.reminders import ReminderService
 from app.payment_history import PAYMENT_HISTORY_PROMPT, group_payment_context
 from app.proof_cleanup import cleanup_reviewed_proofs
+from app.payment_claims import message_date, normalize_claims, period_heading
 from app.remote_services import RemoteStorageError
 
 
@@ -60,15 +61,15 @@ class _AIWaitNotice:
             # A failed progress notice must not prevent the actual response.
             print(f'AI delay notice failed: {type(exc).__name__}')
 
-    def call(self, function: Callable[..., _Result], *args) -> _Result:
+    def call(self, function: Callable[..., _Result], *args, **kwargs) -> _Result:
         if self.attempted:
-            return function(*args)
+            return function(*args, **kwargs)
         timer = Timer(max(0.0, 8.0 - self.elapsed), self._send)
         timer.daemon = True
         started = time.monotonic()
         timer.start()
         try:
-            return function(*args)
+            return function(*args, **kwargs)
         finally:
             self.elapsed += time.monotonic() - started
             timer.cancel()
@@ -77,7 +78,7 @@ class _AIWaitNotice:
 
 
 class AssistantClient(Protocol):
-    def classify_message(self, text: str) -> IntentResult: ...
+    def classify_message(self, text: str, *, reference_date: str | None = None) -> IntentResult: ...
 
     def chat(self, messages: list[dict[str, str]]) -> str: ...
 
@@ -249,24 +250,32 @@ class LandlordBot:
         sender_id: int | None,
         sender_name: str,
         intent: IntentResult,
+        original_text: str = '',
+        reference_date=None,
     ) -> None:
+        reference = reference_date or message_date()
+        lines = normalize_claims(intent.payment_items, intent.payment_categories, reference, intent.billing_period)
+        quote = self.payments.quote(chat_id, lines, amount_claimed=intent.amount_claimed)
+        periods = list(dict.fromkeys(line['period'] for line in lines if line['period']))
         submission = self.payments.create_request(
             group_chat_id=chat_id,
             submitter_user_id=sender_id,
             submitter_name=sender_name,
             source_update_id=update_id,
-            summary=intent.summary,
+            summary=original_text or intent.summary,
+            resident_notes=original_text or intent.summary,
+            claim_lines=lines,
             categories=intent.payment_categories,
-            billing_period=intent.billing_period,
+            billing_period=', '.join(periods) or None,
             amount_claimed=intent.amount_claimed,
         )
-        categories = ", ".join(intent.payment_categories) or "not specified"
         response = self.telegram.send_message(
             chat_id,
-            f"Payment proof #{submission.id} started.\n"
-            "Reply directly to this message with the payment screenshot.\n"
-            f"Claimed items: {categories}\n"
-            f"Billing period: {intent.billing_period or 'not specified'}",
+            f"Hello! Here is your payment request #{submission.id}\n"
+            f"{period_heading(periods)}\n\n"
+            f"{quote}\n\n"
+            "Please send your payment screenshot here.\n"
+            "Payment is subject to landlord approval.\nThank you!",
         )
         request_message_id = response.get("message_id")
         if isinstance(request_message_id, int):
@@ -323,8 +332,9 @@ class LandlordBot:
             )
         self.telegram.send_message(
             chat_id,
-            f"Payment proof #{updated.id} was submitted.\n"
-            "Status: Awaiting landlord review",
+            f"Thank you, Your Image has been Received!\n",
+            "Payment proof #{updated.id} was submitted.\n",
+            "Please wait for landlord review",
         )
         return True
 
@@ -458,6 +468,8 @@ class LandlordBot:
                         summary="Payment proof submission",
                         requires_attachment=True,
                     ),
+                    original_text=text,
+                    reference_date=message_date(message.get('date')),
                 )
             elif command.startswith("/"):
                 self.telegram.send_message(
@@ -470,7 +482,8 @@ class LandlordBot:
                     "Please include a request after mentioning the bot.",
                 )
             else:
-                intent = notice.call(self.assistant.classify_message, cleaned)
+                intent = notice.call(self.assistant.classify_message, cleaned,
+                                     reference_date=message_date(message.get('date')).isoformat())
                 print(f"Classified update {update_id} as {intent.intent}")
                 if intent.intent == "maintenance_request":
                     ticket = self.maintenance.create_ticket(
@@ -499,6 +512,8 @@ class LandlordBot:
                         ),
                         sender_name=sender_name,
                         intent=intent,
+                        original_text=text,
+                        reference_date=message_date(message.get('date')),
                     )
                 elif intent.intent in {"payment_history", "balance_inquiry", "billing_question"}:
                     self._reply_with_payment_history(chat_id, cleaned, notice)
@@ -550,8 +565,11 @@ class LandlordBot:
         while True:
             try:
                 if hasattr(self.database, 'queue_reminders'):
+                    self.database.store.create_due_bills()
                     self.database.queue_reminders()
                 else:
+                    from app.billing import BillingService
+                    BillingService(self.database).create_due_bills()
                     cleanup_reviewed_proofs(self.database, self.proof_dir)
                     ReminderService(self.database).queue_reminders()
                 self.flush_outbox()
