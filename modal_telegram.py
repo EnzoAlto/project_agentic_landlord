@@ -17,6 +17,25 @@ image = (modal.Image.debian_slim(python_version='3.12')
 bot_secret = modal.Secret.from_name('landlord-telegram')
 
 
+@app.function(image=image, secrets=[bot_secret], cpu=0.125, memory=256,
+              min_containers=0, max_containers=1, timeout=150, scaledown_window=2)
+@modal.concurrent(max_inputs=100)
+@modal.asgi_app()
+def dashboard_events():
+    from app.dashboard_events import create_event_app
+    return create_event_app()
+
+
+@app.function(image=image, secrets=[bot_secret], cpu=0.125, memory=256,
+              timeout=60, scaledown_window=2)
+def dashboard_live_config(dataset: str):
+    """SDK-authenticated issuer; never send Modal or Telegram credentials to browsers."""
+    from app.dashboard_events import issue_token
+    config = issue_token(dataset)
+    config['url'] = modal.Function.from_name(APP_NAME, 'dashboard_events').get_web_url() + '/proofs'
+    return config
+
+
 @app.function(image=image, secrets=[bot_secret], cpu=0.25, memory=512,
               max_containers=1, timeout=120, scaledown_window=10)
 @modal.fastapi_endpoint(method='POST', docs=False)

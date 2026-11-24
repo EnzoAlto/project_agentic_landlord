@@ -17,6 +17,7 @@ class RemoteStorageError(RuntimeError):
 class ModalStore:
     def __init__(self, app_name: str, dataset: str, pending_writes: dict):
         import modal
+        self.app_name = app_name
         self.worker = modal.Function.from_name(app_name, 'database_job')
         self.dataset = dataset
         self.pending_writes = pending_writes

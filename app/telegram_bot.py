@@ -51,7 +51,11 @@ class _AIWaitNotice:
     def _send(self) -> None:
         self.attempted = True
         try:
-            self.telegram.send_message(self.chat_id, 'Hello! reading your message')
+            self.telegram.send_message(
+                self.chat_id,
+                'Hello! I’m reading your message.\n'
+                'For quick payments click /payment.',
+            )
         except Exception as exc:
             # A failed progress notice must not prevent the actual response.
             print(f'AI delay notice failed: {type(exc).__name__}')

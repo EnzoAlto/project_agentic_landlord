@@ -36,4 +36,12 @@ def database_job(operation: str, payload: dict | None = None,
         raise ValueError('Unknown dataset')
     worker = SnapshotWorker(Path('/storage') / dataset,
                             reload=volume.reload, commit=volume.commit)
-    return worker.execute(operation, payload, request_id)
+    result = worker.execute(operation, payload, request_id)
+    if operation == 'upload_proof' and result.get('ok'):
+        from app.dashboard_events import publish_proof_saved
+        try:
+            publish_proof_saved(dataset, request_id)
+        except Exception as exc:
+            # Notification failure cannot roll back a successfully saved proof.
+            print(f'Proof saved; dashboard signal unavailable: {type(exc).__name__}')
+    return result

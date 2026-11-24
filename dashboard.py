@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 import os
+import time
+from zoneinfo import ZoneInfo
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from app.billing import BillingService, MonthlyBill, format_peso
 from app.config import Settings
@@ -16,6 +19,12 @@ from app.maintenance import MaintenanceService, VALID_STATUSES
 from app.payments import PaymentService, PaymentSubmission
 from app.reminders import ReminderService
 from app.proof_cleanup import cleanup_reviewed_proofs
+
+
+_proof_updates = components.declare_component(
+    'payment_proof_updates',
+    path=str(Path(__file__).parent / 'app' / 'proof_updates_component'),
+)
 
 
 PAYMENT_STATUS_LABELS = {
@@ -354,11 +363,6 @@ def _render_monthly_ledger(billing: BillingService) -> None:
                 "Rent + parking": format_peso(bill.rent_parking_cents),
                 "Water diff": bill.water_difference if bill.water_difference is not None else "—",
                 "Water bill": format_peso(bill.water_bill_cents),
-                "Electricity diff": (
-                    bill.electricity_difference
-                    if bill.electricity_difference is not None
-                    else "—"
-                ),
                 "Electricity bill": format_peso(bill.electricity_bill_cents),
                 "Total": format_peso(bill.total_due_cents),
                 "Paid / credited": format_peso(bill.allocated_cents),
@@ -405,9 +409,6 @@ def _render_billing_setup(billing: BillingService) -> None:
             "Water present": bill.water_present if bill else None,
             "Water difference": bill.water_difference if bill else None,
             "Water bill": water,
-            "Electricity previous": bill.electricity_previous if bill else prior.electricity_present if prior else None,
-            "Electricity present": bill.electricity_present if bill else None,
-            "Electricity difference": bill.electricity_difference if bill else None,
             "Electricity bill": electricity,
             "Total": rent + water + electricity,
             "Bot status": unit.chatbot_status,
@@ -422,10 +423,10 @@ def _render_billing_setup(billing: BillingService) -> None:
     }
     for column in ("Rent + parking", "Water bill", "Electricity bill", "Total"):
         config[column] = st.column_config.NumberColumn(column, min_value=0.0, format="₱%.2f")
-    for column in ("Water previous", "Water present", "Electricity previous", "Electricity present"):
+    for column in ("Water previous", "Water present"):
         config[column] = st.column_config.NumberColumn(column, min_value=0.0)
     edited = st.data_editor(rows, column_config=config, hide_index=True,
-        disabled=["Unit", "Water difference", "Electricity difference", "Total", "Bot status", "Chat ID"],
+        disabled=["Unit", "Water difference", "Total", "Bot status", "Chat ID"],
         width="stretch", key=f"monthly_editor_{period}")
     edited_rows = edited.to_dict("records") if hasattr(edited, "to_dict") else list(edited)
     st.caption("Blank utility amounts count as ₱0. Calculated columns refresh after saving.")
@@ -443,14 +444,16 @@ def _render_billing_setup(billing: BillingService) -> None:
     if save_clicked:
         records = []
         for row in edited_rows:
+            saved_bill = current.get(row["_id"])
             records.append({
                 "id": row["_id"], "resident_name": row["Name"],
                 "due_day": row["Due day"], "rent_parking": row["Rent + parking"],
                 "telegram_group_chat_id": reverse_labels.get(row["Telegram group"]),
                 "water_previous": row["Water previous"], "water_present": row["Water present"],
                 "water_bill": row["Water bill"],
-                "electricity_previous": row["Electricity previous"],
-                "electricity_present": row["Electricity present"],
+                # Preserve historical readings without exposing them in the editor.
+                "electricity_previous": saved_bill.electricity_previous if saved_bill else None,
+                "electricity_present": saved_bill.electricity_present if saved_bill else None,
                 "electricity_bill": row["Electricity bill"],
             })
         try:
@@ -482,6 +485,38 @@ def _render_submission_history(payments: PaymentService) -> None:
         st.info("No submissions match this filter.")
 
 
+@st.fragment
+def _render_live_payment_panel(payments, billing, proof_root, panel, live):
+    """Only submission panels rerun on pushed events; billing editors stay outside."""
+    store = getattr(payments, 'store', None)
+    if store:
+        store._state = None  # A fragment rerun must not reuse the previous snapshot.
+    st.button('Refresh submissions', key=f'refresh_submissions_{panel}')
+    if store and live:
+        import modal
+        config_key = f'proof_updates_config:{store.app_name}:{store.dataset}'
+        try:
+            config = st.session_state.get(config_key)
+            if not config or config['expires'] <= time.time() + 30:
+                config = modal.Function.from_name('landlord-telegram', 'dashboard_live_config').remote(store.dataset)
+                st.session_state[config_key] = config
+            event = _proof_updates(**config, enabled=True, key=f'proof_updates_{panel}', default=None)
+            if (event and event.get('status') == 'expired'
+                    and event.get('expires') == config['expires']):
+                st.session_state.pop(config_key, None)
+                st.rerun(scope='fragment')
+        except Exception:
+            st.warning('Live payment updates are unavailable. Use Refresh submissions.')
+    elif store:
+        # Rendering disabled disconnects any existing notification stream.
+        _proof_updates(enabled=False, key=f'proof_updates_{panel}', default=None)
+    if panel == 'review':
+        _render_review_queue(payments, billing, proof_root)
+    else:
+        _render_submission_history(payments)
+    st.caption('Last updated: ' + datetime.now(ZoneInfo('Asia/Manila')).strftime('%H:%M:%S Manila'))
+
+
 def _render_payments(
     payments: PaymentService,
     billing: BillingService,
@@ -489,17 +524,24 @@ def _render_payments(
 ) -> None:
     if not getattr(billing, 'store', None):
         cleanup_reviewed_proofs(billing.database, proof_root)
+    live = False
+    if getattr(payments, 'store', None):
+        live = st.toggle(
+            'Live payment updates', value=True, key='live_payment_updates',
+            help='Refresh submissions after a proof is saved and three quiet seconds pass. '
+                 'Keeps a notification connection open; pause to disconnect.',
+        )
     review_tab, ledger_tab, setup_tab, history_tab = st.tabs(
         ["Review queue", "Monthly ledger", "Billing setup", "Submission history"]
     )
     with review_tab:
-        _render_review_queue(payments, billing, proof_root)
+        _render_live_payment_panel(payments, billing, proof_root, 'review', live)
     with ledger_tab:
         _render_monthly_ledger(billing)
     with setup_tab:
         _render_billing_setup(billing)
     with history_tab:
-        _render_submission_history(payments)
+        _render_live_payment_panel(payments, billing, proof_root, 'history', live)
 
 
 def _render_maintenance(maintenance: MaintenanceService) -> None:
