@@ -108,8 +108,6 @@ def _process_lane(lane):
     # Only the standard processor delivers the outbox, avoiding two senders
     # racing to deliver the same landlord notification.
     if lane == 'standard':
-        store.create_due_bills()
-        store.queue_reminders()
         build_cloud_bot(store).flush_outbox()
     return {'active': True, 'lane': lane}
 
@@ -126,6 +124,28 @@ def process_inbox():
               schedule=modal.Cron('* * * * *', timezone='Asia/Manila'))
 def process_quick_commands():
     return _process_lane('quick')
+
+
+@app.function(image=image, secrets=[bot_secret], cpu=0.25, memory=512,
+              min_containers=0, max_containers=1, timeout=180, scaledown_window=10,
+              schedule=modal.Cron('0 8 * * *', timezone='Asia/Manila'))
+def queue_daily_reminders():
+    """Create eligible missing bills and queue reminders at 08:00 Manila daily."""
+    from app.cloud_telegram import cloud_store
+
+    store = cloud_store()
+    bot_id = int(os.environ['TELEGRAM_BOT_ID'])
+    if not store.call('cloud_bot_runtime', {'bot_id': bot_id})['enabled']:
+        return {'paused': True}
+    store.create_due_bills()
+    queued = store.queue_reminders()
+    if queued:
+        try:
+            # Keep all outbox delivery in one processor to prevent duplicate sends.
+            process_inbox.spawn()
+        except Exception:
+            print('Reminders queued; the scheduled inbox processor will deliver them.')
+    return {'queued': queued}
 
 
 @app.function(image=image, secrets=[bot_secret], cpu=0.25, memory=256,

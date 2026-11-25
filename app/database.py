@@ -404,6 +404,7 @@ class Database:
         }
         columns = {
             "bill_id": "INTEGER",
+            "deleted_at": "TEXT",
             "resident_notes": "TEXT",
             "claim_lines_json": "TEXT NOT NULL DEFAULT '[]'",
             "amount_received_cents": "INTEGER",

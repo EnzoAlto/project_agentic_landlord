@@ -479,12 +479,16 @@ def _render_billing_setup(billing: BillingService) -> None:
 
 def _undo_history_approval(row_ids, billing) -> None:
     click = st.session_state.get('undo_approval_click')
-    if not click or click['label'] != 'Undo':
+    if not click or click['label'] not in {'Undo', 'Delete'}:
         return
     index = click['row']
     if not 0 <= index < len(row_ids):
         return
     submission_id = row_ids[index]
+    if click['label'] == 'Delete':
+        st.session_state['payment_delete_confirmation'] = submission_id
+        return
+    st.session_state.pop('payment_delete_confirmation', None)
     try:
         billing.undo_approval(submission_id)
     except (ValueError, LookupError, RemoteStorageError) as exc:
@@ -515,16 +519,38 @@ def _render_submission_history(payments: PaymentService, billing: BillingService
             if label == selected_status
         )
         filtered = [item for item in submissions if item.status == status_key]
+    delete_id = st.session_state.get('payment_delete_confirmation')
+    if delete_id is not None:
+        target = next((item for item in submissions if item.id == delete_id), None)
+        if target is None:
+            st.session_state.pop('payment_delete_confirmation', None)
+        else:
+            with st.container(border=True):
+                st.warning(f'Delete payment request #{delete_id} from {target.group_title}?')
+                st.caption('The request will be canceled and hidden, and any retained screenshot removed. The audit record is kept. No Telegram notification is sent.')
+                confirm_column, cancel_column = st.columns(2)
+                if confirm_column.button('Confirm delete', type='primary', key=f'confirm_delete_{delete_id}'):
+                    try:
+                        payments.delete(delete_id)
+                    except (ValueError, LookupError, RemoteStorageError) as exc:
+                        st.error(str(exc))
+                    else:
+                        st.session_state.pop('payment_delete_confirmation', None)
+                        st.session_state['payment_undo_feedback'] = ('success', f'Payment request #{delete_id} deleted.')
+                        st.rerun()
+                if cancel_column.button('Cancel', key=f'cancel_delete_{delete_id}'):
+                    st.session_state.pop('payment_delete_confirmation', None)
+                    st.rerun()
     if filtered:
         rows = _payment_rows(filtered)
         for row, item in zip(rows, filtered):
-            row['Action'] = 'Undo' if item.status == 'approved' and item.amount_received_cents else None
+            row['Action'] = ('Undo' if item.amount_received_cents else None) if item.status == 'approved' else 'Delete'
         st.dataframe(
             rows, width='stretch', hide_index=True,
             column_config={'Action': st.column_config.ButtonColumn(
                 'Action', key='undo_approval_click', on_click=_undo_history_approval,
                 args=(tuple(item.id for item in filtered), billing),
-                help='Reverse an approval and return it to Pending review without restoring the image. Used credit can prevent undo.',
+                help='Undo an approved payment, or delete an unapproved request after confirmation. Used credit can prevent undo.',
                 pinned=True,
             )},
         )
@@ -580,7 +606,8 @@ def _render_payments(
         live = st.toggle(
             'Live payment updates', value=True, key='live_payment_updates',
             help='Refresh submissions after a proof is saved and three quiet seconds pass. '
-                 'Keeps a notification connection open; pause to disconnect.',
+                 'Pauses automatically while the browser page is hidden and refreshes when you return. '
+                 'Turn off to disconnect live updates.',
         )
     review_tab, ledger_tab, setup_tab, history_tab = st.tabs(
         ["Review queue", "Monthly ledger", "Billing setup", "Submission history"]

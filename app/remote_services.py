@@ -156,6 +156,9 @@ class RemotePaymentService:
     def __init__(self, store: ModalStore):
         self.store = store
 
+    def delete(self, submission_id):
+        return self.store.call('delete_payment', {'submission_id': submission_id}, write=True)
+
     def list_submissions(self, statuses=None):
         return [self._submission(row)
                 for row in self.store.state['payments']

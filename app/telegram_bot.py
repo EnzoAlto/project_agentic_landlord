@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime
 import json
 from uuid import uuid4
 from pathlib import Path
@@ -11,6 +12,7 @@ import time
 import tempfile
 from threading import Timer
 from typing import Callable, Protocol, TypeVar
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -595,17 +597,24 @@ class LandlordBot:
 
     def run_forever(self) -> None:
         offset: int | None = None
+        last_reminder_date = None
         print("Landlord Telegram bot is online. Press Ctrl+C to stop.")
         while True:
             try:
+                now = datetime.now(ZoneInfo('Asia/Manila'))
+                check_reminders = now.hour >= 8 and last_reminder_date != now.date()
                 if hasattr(self.database, 'queue_reminders'):
-                    self.database.store.create_due_bills()
-                    self.database.queue_reminders()
+                    if check_reminders:
+                        self.database.store.create_due_bills()
+                        self.database.queue_reminders()
                 else:
                     from app.billing import BillingService
-                    BillingService(self.database).create_due_bills()
                     cleanup_reviewed_proofs(self.database, self.proof_dir)
-                    ReminderService(self.database).queue_reminders()
+                    if check_reminders:
+                        BillingService(self.database).create_due_bills()
+                        ReminderService(self.database).queue_reminders()
+                if check_reminders:
+                    last_reminder_date = now.date()
                 self.flush_outbox()
                 updates = self.telegram.get_updates(offset)
                 for update in updates:

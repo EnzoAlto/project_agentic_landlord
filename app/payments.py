@@ -116,6 +116,8 @@ class PaymentService:
                 (source_update_id,),
             ).fetchone()
             if existing:
+                if existing['deleted_at']:
+                    raise ValueError('This payment request was canceled')
                 return _submission_from_row(existing)
 
             cursor = connection.execute(
@@ -172,6 +174,7 @@ class PaymentService:
         parameters: list[object] = [group_chat_id]
         conditions = [
             "p.group_chat_id = ?",
+            "p.deleted_at IS NULL",
             "p.status IN ('awaiting_proof', 'needs_information')",
         ]
         if submitter_user_id is not None:
@@ -210,6 +213,7 @@ class PaymentService:
                     caption = ?, status = 'pending_review',
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
+                  AND deleted_at IS NULL
                   AND status IN ('awaiting_proof', 'needs_information')
                 """,
                 (
@@ -221,7 +225,7 @@ class PaymentService:
                 ),
             )
             row = connection.execute(
-                self._select_sql() + " WHERE p.id = ?", (submission_id,)
+                self._select_sql() + " WHERE p.id = ? AND p.deleted_at IS NULL", (submission_id,)
             ).fetchone()
         if row is None:
             raise LookupError(f"Payment submission {submission_id} was not found")
@@ -230,7 +234,7 @@ class PaymentService:
     def get(self, submission_id: int) -> PaymentSubmission:
         with self.database.connection() as connection:
             row = connection.execute(
-                self._select_sql() + " WHERE p.id = ?", (submission_id,)
+                self._select_sql() + " WHERE p.id = ? AND p.deleted_at IS NULL", (submission_id,)
             ).fetchone()
         if row is None:
             raise LookupError(f"Payment submission {submission_id} was not found")
@@ -239,17 +243,43 @@ class PaymentService:
     def list_submissions(
         self, statuses: tuple[str, ...] | None = None
     ) -> list[PaymentSubmission]:
-        sql = self._select_sql()
+        sql = self._select_sql() + ' WHERE p.deleted_at IS NULL'
         parameters: tuple[object, ...] = ()
         if statuses:
             placeholders = ",".join("?" for _ in statuses)
-            sql += f" WHERE p.status IN ({placeholders})"
+            sql += f" AND p.status IN ({placeholders})"
             parameters = tuple(statuses)
         sql += " ORDER BY p.id DESC"
 
         with self.database.connection() as connection:
             rows = connection.execute(sql, parameters).fetchall()
         return [_submission_from_row(row) for row in rows]
+
+    def delete(self, submission_id: int, *, actor: str = 'dashboard') -> dict:
+        """Cancel an unapproved request, retaining its row and audit history."""
+        with self.database.connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT * FROM payment_submissions WHERE id = ?', (submission_id,)).fetchone()
+            if row is None:
+                raise LookupError('Payment submission was not found')
+            if row['status'] == 'approved':
+                raise ValueError('Undo approval before deleting this payment request')
+            if row['deleted_at']:
+                return {'submission_id': submission_id, 'deleted': True}
+            if row['status'] not in {'awaiting_proof', 'pending_review', 'needs_information', 'rejected'}:
+                raise ValueError('This payment request cannot be deleted')
+            allocations = connection.execute("SELECT 1 FROM bill_allocations WHERE source_type = 'payment' AND source_id = ? LIMIT 1", (submission_id,)).fetchone()
+            credit = connection.execute('SELECT 1 FROM credit_transactions WHERE payment_submission_id = ? LIMIT 1', (submission_id,)).fetchone()
+            if allocations or credit or any(row[key] for key in ('amount_received_cents', 'applied_amount_cents', 'credit_amount_cents')):
+                raise ValueError('This submission has financial records. Reconcile or undo the payment before deleting it.')
+            queue_proof_cleanup(connection, row)
+            connection.execute('''UPDATE payment_submissions SET deleted_at = CURRENT_TIMESTAMP,
+                proof_path = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?''', (submission_id,))
+            connection.execute("INSERT INTO audit_events(entity_type, entity_id, action, actor, details_json) VALUES ('payment_submission', ?, 'canceled', ?, ?)",
+                               (submission_id, actor, json.dumps({'previous_status': row['status']})))
+        if self.cleanup_proofs:
+            cleanup_reviewed_proofs(self.database)
+        return {'submission_id': submission_id, 'deleted': True}
 
     def review(
         self,
@@ -264,7 +294,7 @@ class PaymentService:
 
         with self.database.connection() as connection:
             current = connection.execute(
-                "SELECT * FROM payment_submissions WHERE id = ?",
+                "SELECT * FROM payment_submissions WHERE id = ? AND deleted_at IS NULL",
                 (submission_id,),
             ).fetchone()
             if current is None:

@@ -4,16 +4,27 @@
 <script>
 (() => {
   let config, controller, retryTimer, debounceTimer, lastRevision = '', pendingRevision = '';
-  let activeSignature = '', retryDelay = 1000, lastStatus = '';
+  let activeSignature = '', retryDelay = 1000, generation = 0;
+  let pageHidden = false, visibilityPaused = document.hidden, resumeSequence = 0;
   const statusElement = document.getElementById('status');
   const post = (type, fields = {}) => parent.postMessage({isStreamlitMessage:true, type, ...fields}, '*');
   const emit = (value) => post('streamlit:setComponentValue', {value, dataType:'json'});
   function status(text) { statusElement.textContent = text; }
+  function canConnect() { return config?.enabled && !document.hidden && !pageHidden; }
+  function disconnect() {
+    generation++;
+    controller?.abort();
+    controller = null;
+    clearTimeout(retryTimer);
+    clearTimeout(debounceTimer);
+    pendingRevision = '';
+  }
   function notify(revision) {
     if (!revision || revision === lastRevision || revision === pendingRevision) return;
     pendingRevision = revision;
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
+      if (!canConnect()) return;
       lastRevision = pendingRevision;
       pendingRevision = '';
       emit({revision:lastRevision, status:'updated'});
@@ -21,24 +32,28 @@
     }, 3000);
   }
   async function connect() {
-    if (!config?.enabled) return;
-    controller = new AbortController();
+    if (!canConnect()) return;
+    const connectionGeneration = ++generation;
+    const connectionConfig = config;
+    const connectionController = new AbortController();
+    controller = connectionController;
+    const current = () => connectionGeneration === generation && canConnect();
     try {
-      const response = await fetch(config.url, {headers:{Authorization:`Bearer ${config.token}`}, signal:controller.signal});
+      const response = await fetch(connectionConfig.url, {headers:{Authorization:`Bearer ${connectionConfig.token}`}, signal:connectionController.signal});
+      if (!current()) return;
       if (response.status === 401) {
         status('Reconnecting payment updates…');
-        emit({revision:lastRevision, status:'expired', expires:config.expires});
+        emit({revision:lastRevision, status:'expired', expires:connectionConfig.expires});
         return;
       }
       if (!response.ok || !response.body) throw new Error('Connection unavailable');
       retryDelay = 1000;
       status('Live payment updates connected');
-      lastStatus = '';
       const reader = response.body.getReader(), decoder = new TextDecoder();
       let buffer = '';
       while (true) {
         const {done, value} = await reader.read();
-        if (done) break;
+        if (done || !current()) break;
         buffer += decoder.decode(value, {stream:true});
         let boundary;
         while ((boundary = buffer.indexOf('\n\n')) >= 0) {
@@ -48,13 +63,29 @@
         }
       }
     } catch (error) {
-      if (error.name === 'AbortError') return;
+      if (error.name === 'AbortError' || !current()) return;
       status('Live updates reconnecting. You can also use Refresh submissions.');
     }
-    if (config?.enabled) {
+    if (current()) {
       clearTimeout(retryTimer);
       retryTimer = setTimeout(connect, retryDelay);
       retryDelay = Math.min(retryDelay * 2, 30000);
+    }
+  }
+  function visibilityChanged() {
+    if (document.hidden || pageHidden) {
+      visibilityPaused = true;
+      disconnect();
+      status(config?.enabled ? 'Live updates paused while this page is hidden' : 'Live payment updates paused');
+    } else if (visibilityPaused) {
+      visibilityPaused = false;
+      if (!config?.enabled) return;
+      retryDelay = 1000;
+      // Component values rerun only this submission fragment. Refresh even
+      // when no proof event occurred: approvals/deletions do not publish one.
+      emit({revision:lastRevision, status:'resumed', resume:++resumeSequence});
+      status('Refreshing payment updates…');
+      connect();
     }
   }
   addEventListener('message', event => {
@@ -63,13 +94,17 @@
     const signature = JSON.stringify([next.enabled, next.url, next.token]);
     if (signature === activeSignature) return;
     activeSignature = signature;
-    controller?.abort(); clearTimeout(retryTimer); clearTimeout(debounceTimer);
-    pendingRevision = ''; config = next;
+    disconnect();
+    config = next;
     if (!lastRevision) lastRevision = next.revision || '';
-    if (next.enabled) connect(); else status('Live payment updates paused');
+    visibilityPaused = document.hidden || pageHidden;
+    if (canConnect()) connect();
+    else status(next.enabled ? 'Live updates paused while this page is hidden' : 'Live payment updates paused');
     post('streamlit:setFrameHeight', {height:32});
   });
-  addEventListener('pagehide', () => {config = null; controller?.abort(); clearTimeout(retryTimer); clearTimeout(debounceTimer);});
+  document.addEventListener('visibilitychange', visibilityChanged);
+  addEventListener('pagehide', () => {pageHidden = true; visibilityChanged();});
+  addEventListener('pageshow', () => {pageHidden = false; visibilityChanged();});
   post('streamlit:componentReady', {apiVersion:1});
   post('streamlit:setFrameHeight', {height:32});
 })();

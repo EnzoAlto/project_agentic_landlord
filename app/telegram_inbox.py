@@ -86,6 +86,7 @@ def dispatch_inbox(database, operation, payload):
                     chat, sender = (message.get('chat') or {}).get('id'), (message.get('from') or {}).get('id')
                     awaiting = connection.execute("""SELECT 1 FROM payment_submissions WHERE
                         group_chat_id = ? AND submitter_user_id = ?
+                        AND deleted_at IS NULL
                         AND status IN ('awaiting_proof', 'needs_information') LIMIT 1""", (chat, sender)).fetchone()
                     # An image can arrive while natural-language payment intent
                     # is still being classified. Hold it until that earlier

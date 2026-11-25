@@ -676,7 +676,7 @@ class BillingService:
         with self.database.connection() as connection:
             connection.execute('BEGIN IMMEDIATE')
             submission = connection.execute(
-                "SELECT * FROM payment_submissions WHERE id = ?", (submission_id,)
+                "SELECT * FROM payment_submissions WHERE id = ? AND deleted_at IS NULL", (submission_id,)
             ).fetchone()
             placeholders = ','.join('?' for _ in selected_ids)
             bills = connection.execute(
@@ -811,7 +811,7 @@ class BillingService:
         date.fromisoformat(received_date)
         with self.database.connection() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            submission = connection.execute('SELECT * FROM payment_submissions WHERE id = ?', (submission_id,)).fetchone()
+            submission = connection.execute('SELECT * FROM payment_submissions WHERE id = ? AND deleted_at IS NULL', (submission_id,)).fetchone()
             if submission is None:
                 raise LookupError('Payment submission was not found')
             if submission['status'] != 'pending_review':
@@ -844,7 +844,7 @@ class BillingService:
         """Return an approval to review without restoring its proof image."""
         with self.database.connection() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            submission = connection.execute('SELECT * FROM payment_submissions WHERE id = ?', (submission_id,)).fetchone()
+            submission = connection.execute('SELECT * FROM payment_submissions WHERE id = ? AND deleted_at IS NULL', (submission_id,)).fetchone()
             if submission is None:
                 raise LookupError('Payment submission was not found')
             if submission['status'] != 'approved':

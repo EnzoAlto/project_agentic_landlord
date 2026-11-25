@@ -82,7 +82,7 @@ def group_payment_context(database: Database, chat_id: int) -> dict:
                       p.received_date, p.amount_received_cents,
                       p.applied_amount_cents, p.credit_amount_cents
                FROM payment_submissions p
-               WHERE p.group_chat_id = ? ORDER BY p.id DESC LIMIT 20''',
+               WHERE p.group_chat_id = ? AND p.deleted_at IS NULL ORDER BY p.id DESC LIMIT 20''',
             (chat_id,),
         ).fetchall()
         bills = connection.execute(

@@ -41,7 +41,7 @@ WRITE_OPERATIONS = {
     'mark_update_processed', 'mark_outbox_sent', 'mark_outbox_failed',
     'create_payment_request', 'set_request_message', 'upload_proof',
     'set_cloud_bot_runtime', 'enqueue_telegram_update', 'finish_telegram_update',
-    'fail_telegram_update', 'record_advance', 'create_due_bills', 'undo_approval',
+    'fail_telegram_update', 'record_advance', 'create_due_bills', 'undo_approval', 'delete_payment',
 }
 WRITE_OPERATIONS.update(INBOX_WRITES)
 
@@ -60,6 +60,8 @@ def _dispatch(database: Database, operation: str, payload: dict) -> object:
     billing = BillingService(database, cleanup_proofs=False)
     maintenance = MaintenanceService(database)
     payments = PaymentService(database, cleanup_proofs=False)
+    if operation == 'delete_payment':
+        return payments.delete(**payload)
     if operation == 'undo_approval':
         return billing.undo_approval(**payload)
     if operation == 'payment_quote':
