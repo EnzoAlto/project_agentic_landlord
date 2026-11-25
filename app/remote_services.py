@@ -23,10 +23,16 @@ class ModalStore:
         self.dataset = dataset
         self.pending_writes = pending_writes
         self._state = None
+        self.telegram_context = None
 
     def call(self, operation: str, payload: dict | None = None, *, write: bool = False,
              request_id: str | None = None):
         payload = {} if payload is None else payload
+        if self.telegram_context and operation in {
+            'create_payment_request', 'create_maintenance', 'set_request_message',
+            'mark_update_processed',
+        }:
+            payload = {**payload, '_telegram_context': self.telegram_context}
         # Preserve the same ID across uncertain retries and Streamlit reruns.
         key = json.dumps([self.dataset, operation, payload], sort_keys=True, allow_nan=False)
         if write:

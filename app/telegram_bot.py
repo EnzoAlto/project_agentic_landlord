@@ -23,6 +23,8 @@ from app.payment_history import PAYMENT_HISTORY_PROMPT, group_payment_context
 from app.proof_cleanup import cleanup_reviewed_proofs
 from app.payment_claims import message_date, normalize_claims, period_heading
 from app.remote_services import RemoteStorageError
+from app.quick_replies import billing_reply, payment_history_reply
+from app.telegram_inbox import RequestSuperseded, command_for
 
 
 class TelegramAPIError(RuntimeError):
@@ -43,19 +45,26 @@ _Result = TypeVar('_Result')
 class _AIWaitNotice:
     """One delay notice per incoming message, counting time spent awaiting AI."""
 
-    def __init__(self, telegram: TelegramTransport, chat_id: int):
+    def __init__(self, telegram: TelegramTransport, chat_id: int, claim_notice=None):
         self.telegram = telegram
         self.chat_id = chat_id
         self.elapsed = 0.0
         self.attempted = False
+        self.claim_notice = claim_notice
 
     def _send(self) -> None:
         self.attempted = True
         try:
+            if self.claim_notice is not None and not self.claim_notice():
+                return
             self.telegram.send_message(
                 self.chat_id,
                 'Hello! I’m reading your message.\n'
-                'For quick payments click /payment.',
+                '\n'
+                'Here are some Quick actions if I take too long to respond:\n'
+                '/payment — Submit payment proof\n'
+                '/billing — View your bills and balance\n'
+                '/payment_history — View your payment history',
             )
         except Exception as exc:
             # A failed progress notice must not prevent the actual response.
@@ -170,6 +179,8 @@ class LandlordBot:
         bot_username: str,
         bot_user_id: int,
         proof_dir: Path,
+        request_active=None,
+        claim_notice=None,
     ):
         self.database = database
         self.maintenance = maintenance
@@ -179,6 +190,8 @@ class LandlordBot:
         self.bot_username = bot_username.lstrip("@").lower()
         self.bot_user_id = bot_user_id
         self.proof_dir = proof_dir
+        self.request_active = request_active or (lambda: True)
+        self.claim_notice = claim_notice
         self.conversation_history: dict[int, list[dict[str, str]]] = defaultdict(list)
 
     @staticmethod
@@ -332,8 +345,8 @@ class LandlordBot:
             )
         self.telegram.send_message(
             chat_id,
-            f"Thank you, Your Image has been Received!\n",
-            "Payment proof #{updated.id} was submitted.\n",
+            "Thank you, Your Image has been Received!\n"
+            f"Payment proof #{updated.id} was submitted.\n"
             "Please wait for landlord review",
         )
         return True
@@ -344,13 +357,15 @@ class LandlordBot:
         context = (self.database.payment_context(chat_id)
                    if hasattr(self.database, 'payment_context')
                    else group_payment_context(self.database, chat_id))
-        notice = notice or _AIWaitNotice(self.telegram, chat_id)
+        notice = notice or _AIWaitNotice(self.telegram, chat_id, self.claim_notice)
         reply = notice.call(self.assistant.chat, [
             {'role': 'system', 'content': PAYMENT_HISTORY_PROMPT},
             {'role': 'user', 'content': json.dumps({
                 'question': question, 'authorized_records': context,
             }, ensure_ascii=False)},
         ])
+        if not self.request_active():
+            raise RequestSuperseded('A quick command replaced the pending AI response')
         self.telegram.send_message(chat_id, reply)
 
     def handle_update(self, update: dict) -> bool:
@@ -420,14 +435,16 @@ class LandlordBot:
                 return handled
 
             cleaned = self._clean_text(text)
-            command = cleaned.split(maxsplit=1)[0].lower() if cleaned else ""
-            notice = _AIWaitNotice(self.telegram, chat_id)
+            command = command_for(message, self.bot_username)
+            notice = _AIWaitNotice(self.telegram, chat_id, self.claim_notice)
+            if not self.request_active():
+                raise RequestSuperseded('A quick command replaced this request')
 
             if command in {"/start", "/help"}:
                 self.telegram.send_message(
                     chat_id,
                     "Mention me with a maintenance or payment request.\n"
-                    "Commands: /tickets, /maintenance <issue>, /payment, /payments, /reset",
+                    "Commands: /payment, /billing, /payment_history, /payments, /tickets, /maintenance <issue>, /reset",
                 )
             elif command == '/maintenance':
                 description = cleaned[len(command):].strip()
@@ -443,6 +460,16 @@ class LandlordBot:
                     self.telegram.send_message(chat_id, f'Maintenance ticket #{ticket.id} created. Status: {ticket.status}')
             elif command == "/payments":
                 self._reply_with_payment_history(chat_id, 'Show our payment history.', notice)
+            elif command in {'/billing', '/payment_history'}:
+                acknowledgement = ('Okay, checking your bills now.' if command == '/billing'
+                                   else 'Okay, checking your payment history now.')
+                if self.claim_notice is None or self.claim_notice():
+                    self.telegram.send_message(chat_id, acknowledgement)
+                context = (self.database.payment_context(chat_id)
+                           if hasattr(self.database, 'payment_context')
+                           else group_payment_context(self.database, chat_id))
+                self.telegram.send_message(chat_id, billing_reply(context) if command == '/billing'
+                                           else payment_history_reply(context))
             elif command == "/reset":
                 self.conversation_history.pop(chat_id, None)
                 self.telegram.send_message(chat_id, "Conversation memory cleared.")
@@ -458,6 +485,8 @@ class LandlordBot:
                 )
                 self.telegram.send_message(chat_id, reply)
             elif command == "/payment":
+                if self.claim_notice is None or self.claim_notice():
+                    self.telegram.send_message(chat_id, 'Okay, starting your payment submission now.')
                 self._start_payment_request(
                     update_id=update_id,
                     chat_id=chat_id,
@@ -484,6 +513,8 @@ class LandlordBot:
             else:
                 intent = notice.call(self.assistant.classify_message, cleaned,
                                      reference_date=message_date(message.get('date')).isoformat())
+                if not self.request_active():
+                    raise RequestSuperseded('A quick command replaced the pending AI request')
                 print(f"Classified update {update_id} as {intent.intent}")
                 if intent.intent == "maintenance_request":
                     ticket = self.maintenance.create_ticket(
@@ -537,6 +568,9 @@ class LandlordBot:
                     history.append({"role": "assistant", "content": reply})
                     history[:] = history[-12:]
                     self.telegram.send_message(chat_id, reply)
+        except RequestSuperseded:
+            print(f'Telegram update {update_id} superseded; skipping pending actions and reply')
+            return False
         except AssistantUnavailableError:
             self.telegram.send_message(chat_id,
                 'AI replies are temporarily unavailable. Use /payment to send proof, '

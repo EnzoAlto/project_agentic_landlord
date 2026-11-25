@@ -22,6 +22,9 @@ from app.payment_history import group_payment_context
 from app.payments import PaymentService
 from app.reminders import ReminderService
 from app.proof_cleanup import cleanup_reviewed_proofs
+from app.telegram_inbox import (INBOX_READS, INBOX_WRITES, QUICK_COMMANDS,
+                                command_for, lane_for, request_active,
+                                dispatch_inbox, RequestSuperseded)
 
 
 READ_OPERATIONS = {
@@ -31,6 +34,7 @@ READ_OPERATIONS = {
     'group_maintenance', 'payment_quote',
     'cloud_bot_runtime', 'next_telegram_update',
 }
+READ_OPERATIONS.update(INBOX_READS)
 WRITE_OPERATIONS = {
     'save_month_table', 'register_group', 'create_maintenance',
     'set_maintenance_status', 'import_database', 'apply_payment', 'review_payment', 'queue_reminders',
@@ -39,9 +43,20 @@ WRITE_OPERATIONS = {
     'set_cloud_bot_runtime', 'enqueue_telegram_update', 'finish_telegram_update',
     'fail_telegram_update', 'record_advance', 'create_due_bills', 'undo_approval',
 }
+WRITE_OPERATIONS.update(INBOX_WRITES)
 
 
 def _dispatch(database: Database, operation: str, payload: dict) -> object:
+    if operation in INBOX_READS | INBOX_WRITES:
+        return dispatch_inbox(database, operation, payload)
+    context = payload.pop('_telegram_context', None)
+    if context is not None:
+        with database.connection() as connection:
+            if not request_active(connection, context, check_superseded=operation != 'mark_update_processed'):
+                raise RequestSuperseded('Telegram request was superseded or its lease expired')
+            if operation in {'create_payment_request', 'create_maintenance'}:
+                connection.execute('UPDATE telegram_inbox SET workflow_started = 1 WHERE bot_id = ? AND update_id = ?',
+                                   (context['bot_id'], context['update_id']))
     billing = BillingService(database, cleanup_proofs=False)
     maintenance = MaintenanceService(database)
     payments = PaymentService(database, cleanup_proofs=False)
@@ -69,9 +84,11 @@ def _dispatch(database: Database, operation: str, payload: dict) -> object:
         if not isinstance(update, dict) or not isinstance(update.get('update_id'), int):
             raise ValueError('Invalid Telegram update')
         with database.connection() as connection:
-            connection.execute('''INSERT OR IGNORE INTO telegram_inbox(bot_id, update_id, payload_json)
-                                  VALUES (?, ?, ?)''',
-                               (payload['bot_id'], update['update_id'], json.dumps(update)))
+            username = payload.get('bot_username', '')
+            connection.execute('''INSERT OR IGNORE INTO telegram_inbox
+                (bot_id, update_id, payload_json, lane, is_quick_command) VALUES (?, ?, ?, ?, ?)''',
+                (payload['bot_id'], update['update_id'], json.dumps(update), lane_for(update, username),
+                 command_for(update.get('message') or {}, username) in QUICK_COMMANDS))
         return {'queued': True}
     if operation == 'next_telegram_update':
         with database.connection() as connection:
@@ -82,16 +99,16 @@ def _dispatch(database: Database, operation: str, payload: dict) -> object:
         return json.loads(row['payload_json']) if row and row['ready'] else None
     if operation == 'finish_telegram_update':
         with database.connection() as connection:
-            connection.execute("UPDATE telegram_inbox SET state = 'done', last_error = NULL WHERE bot_id = ? AND update_id = ?",
-                               (payload['bot_id'], payload['update_id']))
+            connection.execute("UPDATE telegram_inbox SET state = 'done', last_error = NULL, lease_until = NULL WHERE bot_id = ? AND update_id = ? AND (? IS NULL OR owner = ?)",
+                               (payload['bot_id'], payload['update_id'], payload.get('owner'), payload.get('owner')))
         return True
     if operation == 'fail_telegram_update':
         with database.connection() as connection:
             connection.execute('''UPDATE telegram_inbox SET attempts = attempts + 1,
                 state = CASE WHEN attempts >= 4 THEN 'failed' ELSE 'pending' END,
-                retry_after = datetime('now', '+1 minute'), last_error = ?
-                WHERE bot_id = ? AND update_id = ?''',
-                (payload['error'], payload['bot_id'], payload['update_id']))
+                retry_after = datetime('now', '+1 minute'), last_error = ?, owner = NULL, lease_until = NULL
+                WHERE bot_id = ? AND update_id = ? AND (? IS NULL OR owner = ?)''',
+                (payload['error'], payload['bot_id'], payload['update_id'], payload.get('owner'), payload.get('owner')))
         return True
     if operation == 'is_update_processed':
         return database.is_update_processed(**payload)
@@ -264,6 +281,8 @@ class SnapshotWorker:
             # An idle reminder check makes no changes and needs no receipt or
             # new snapshot. Avoid thousands of identical backups each day.
             no_change = ((operation == 'queue_reminders' and result == 0)
+                         or (operation == 'claim_telegram_update' and result is None)
+                         or (operation == 'claim_telegram_notice' and result is False)
                          or (operation == 'create_due_bills' and not result['changed']))
             if writing and not no_change:
                 with database.connection() as connection:

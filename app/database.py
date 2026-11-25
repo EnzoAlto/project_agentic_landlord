@@ -276,6 +276,16 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as connection:
             connection.executescript(BASE_SCHEMA)
+            inbox_columns = {row['name'] for row in connection.execute('PRAGMA table_info(telegram_inbox)')}
+            for name, definition in {
+                'lane': "TEXT NOT NULL DEFAULT 'standard'",
+                'is_quick_command': 'INTEGER NOT NULL DEFAULT 0',
+                'owner': 'TEXT', 'lease_until': 'TEXT',
+                'workflow_started': 'INTEGER NOT NULL DEFAULT 0',
+                'notice_sent': 'INTEGER NOT NULL DEFAULT 0',
+            }.items():
+                if name not in inbox_columns:
+                    connection.execute(f'ALTER TABLE telegram_inbox ADD COLUMN {name} {definition}')
             self._migrate_maintenance_requests(connection)
             self._migrate_payment_submissions(connection)
             self._seed_units(connection)

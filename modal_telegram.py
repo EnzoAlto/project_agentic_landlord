@@ -3,6 +3,7 @@
 import hmac
 import os
 import time
+from uuid import uuid4
 
 import modal
 from fastapi import HTTPException, Request
@@ -41,6 +42,7 @@ def dashboard_live_config(dataset: str):
 @modal.fastapi_endpoint(method='POST', docs=False)
 def webhook(request: Request, update: dict):
     from app.cloud_telegram import cloud_store
+    from app.telegram_inbox import lane_for
 
     supplied = request.headers.get('X-Telegram-Bot-Api-Secret-Token', '')
     if not hmac.compare_digest(supplied.encode(), os.environ['TELEGRAM_WEBHOOK_SECRET'].encode()):
@@ -52,51 +54,78 @@ def webhook(request: Request, update: dict):
     try:
         if not store.call('cloud_bot_runtime', {'bot_id': bot_id})['enabled']:
             raise HTTPException(status_code=503, detail='Cloud bot is paused')
-        store.call('enqueue_telegram_update', {'bot_id': bot_id, 'update': update},
-                   write=True, request_id=f"inbox-{bot_id}-{update['update_id']}")
+        store.call('enqueue_telegram_update', {'bot_id': bot_id, 'update': update,
+                   'bot_username': os.environ['TELEGRAM_BOT_USERNAME']},
+                   write=True, request_id=f"inbox-v2-{bot_id}-{update['update_id']}")
     except HTTPException:
         raise
     except Exception:
         raise HTTPException(status_code=503, detail='Could not persist update') from None
     # Acknowledge only after persistence. The schedule recovers a failed spawn.
     try:
-        process_inbox.spawn()
+        if lane_for(update, os.environ['TELEGRAM_BOT_USERNAME']) == 'quick':
+            process_quick_commands.spawn()
+        else:
+            process_inbox.spawn()
     except Exception:
         print('Update persisted; scheduled processor will handle it.')
     return {'ok': True}
+
+
+def _process_lane(lane):
+    from app.cloud_telegram import cloud_store, build_cloud_bot
+    from app.telegram_inbox import RequestSuperseded
+
+    store = cloud_store()
+    bot_id = int(os.environ['TELEGRAM_BOT_ID'])
+    if not store.call('cloud_bot_runtime', {'bot_id': bot_id})['enabled']:
+        return {'paused': True}
+    owner = str(uuid4())
+    started = time.monotonic()
+    for _ in range(10):
+        if time.monotonic() - started > 300:
+            break
+        update = store.call('claim_telegram_update',
+                            {'bot_id': bot_id, 'lane': lane, 'owner': owner}, write=True)
+        if update is None:
+            break
+        context = {'bot_id': bot_id, 'update_id': update['update_id'], 'owner': owner}
+        bot = build_cloud_bot(store, context)
+        print(f"Claimed Telegram update {update['update_id']} in {lane} lane")
+        try:
+            bot.handle_update(update)
+        except RequestSuperseded:
+            print(f"Telegram update {update['update_id']} superseded; no delayed response")
+        except Exception as exc:
+            store.call('fail_telegram_update', {**context, 'error': type(exc).__name__}, write=True)
+            print(f"Update {update['update_id']} deferred: {type(exc).__name__}")
+            break
+        else:
+            store.call('finish_telegram_update', context, write=True)
+            continue
+        store.call('finish_telegram_update', context, write=True)
+    store.telegram_context = None
+    # Only the standard processor delivers the outbox, avoiding two senders
+    # racing to deliver the same landlord notification.
+    if lane == 'standard':
+        store.create_due_bills()
+        store.queue_reminders()
+        build_cloud_bot(store).flush_outbox()
+    return {'active': True, 'lane': lane}
 
 
 @app.function(image=image, secrets=[bot_secret], cpu=0.25, memory=512,
               max_containers=1, timeout=480, scaledown_window=10,
               schedule=modal.Cron('* * * * *', timezone='Asia/Manila'))
 def process_inbox():
-    from app.cloud_telegram import cloud_store, build_cloud_bot
+    return _process_lane('standard')
 
-    store = cloud_store()
-    bot_id = int(os.environ['TELEGRAM_BOT_ID'])
-    if not store.call('cloud_bot_runtime', {'bot_id': bot_id})['enabled']:
-        return {'paused': True}
-    bot = build_cloud_bot(store)
-    started = time.monotonic()
-    for _ in range(10):
-        if time.monotonic() - started > 300:
-            break
-        update = store.call('next_telegram_update', {'bot_id': bot_id})
-        if update is None:
-            break
-        try:
-            bot.handle_update(update)
-            store.call('finish_telegram_update', {'bot_id': bot_id, 'update_id': update['update_id']}, write=True)
-        except Exception as exc:
-            # Store the exception type, never a token-bearing URL or full payload.
-            store.call('fail_telegram_update', {'bot_id': bot_id, 'update_id': update['update_id'],
-                       'error': type(exc).__name__}, write=True)
-            print(f"Update {update['update_id']} deferred: {type(exc).__name__}")
-            break
-    store.create_due_bills()
-    store.queue_reminders()
-    bot.flush_outbox()
-    return {'active': True}
+
+@app.function(image=image, secrets=[bot_secret], cpu=0.25, memory=512,
+              max_containers=1, min_containers=0, timeout=480, scaledown_window=10,
+              schedule=modal.Cron('* * * * *', timezone='Asia/Manila'))
+def process_quick_commands():
+    return _process_lane('quick')
 
 
 @app.function(image=image, secrets=[bot_secret], cpu=0.25, memory=256,

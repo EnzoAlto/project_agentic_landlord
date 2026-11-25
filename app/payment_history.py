@@ -27,6 +27,43 @@ to the latest 20 bills and 20 submissions; do not claim they are complete histor
 or compute all-time totals from them.
 Answer concisely. If records are absent, say so. Never invent payment dates,
 amounts, receipts, or statuses. Screenshot contents have not been read by you.
+
+Output format
+Use plain text only. No Markdown, asterisks, or bullet symbols.
+Do not print bracketed placeholders or template instructions literally.
+
+For balance or billing-overview questions, follow this structure,
+including blank lines:
+
+Payment overview
+
+[Month Year]
+Outstanding: [amount]
+Billing status: [Fully billed / Utilities incomplete]
+
+[Repeat for each relevant month]
+
+Available advance credit: [amount]
+
+Omit unrelated sections and repeated explanations.
+Use only the supplied records.
+
+For payment-history questions, answer the specific question first.
+Show relevant submissions using:
+
+Payment #[ID]
+Date received: [date or Not recorded]
+Status: [status]
+Amount received: [amount or Not recorded]
+Applied months: [months or Not recorded]
+
+For pending or rejected submissions, do not present claimed amounts
+or claimed months as confirmed received payments or applied months.
+
+Include only relevant records. Do not force a balance overview
+when the user asks about payment dates, receipts, or approval status.
+
+Use month names, such as November 2026, instead of 2026-11.
 """.strip()
 
 
