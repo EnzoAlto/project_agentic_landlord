@@ -116,14 +116,14 @@ def _process_lane(lane):
 
 @app.function(image=image, secrets=[bot_secret], cpu=0.25, memory=512,
               max_containers=1, timeout=480, scaledown_window=10,
-              schedule=modal.Cron('* * * * *', timezone='Asia/Manila'))
+              schedule=modal.Cron('*/5 * * * *', timezone='Asia/Manila'))
 def process_inbox():
     return _process_lane('standard')
 
 
 @app.function(image=image, secrets=[bot_secret], cpu=0.25, memory=512,
               max_containers=1, min_containers=0, timeout=480, scaledown_window=10,
-              schedule=modal.Cron('* * * * *', timezone='Asia/Manila'))
+              schedule=modal.Cron('*/5 * * * *', timezone='Asia/Manila'))
 def process_quick_commands():
     return _process_lane('quick')
 
