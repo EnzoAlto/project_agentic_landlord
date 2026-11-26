@@ -35,6 +35,7 @@ READ_OPERATIONS = {
     'cloud_bot_runtime', 'next_telegram_update',
 }
 READ_OPERATIONS.update(INBOX_READS)
+READ_OPERATIONS.add('mcp_admin_read')
 WRITE_OPERATIONS = {
     'save_month_table', 'register_group', 'create_maintenance',
     'set_maintenance_status', 'import_database', 'apply_payment', 'review_payment', 'queue_reminders',
@@ -42,11 +43,15 @@ WRITE_OPERATIONS = {
     'create_payment_request', 'set_request_message', 'upload_proof',
     'set_cloud_bot_runtime', 'enqueue_telegram_update', 'finish_telegram_update',
     'fail_telegram_update', 'record_advance', 'create_due_bills', 'undo_approval', 'delete_payment',
+    'save_bill_notes', 'save_payment_notes',
 }
 WRITE_OPERATIONS.update(INBOX_WRITES)
 
 
 def _dispatch(database: Database, operation: str, payload: dict) -> object:
+    if operation == 'mcp_admin_read':
+        from app.mcp_queries import admin_read
+        return admin_read(database, **payload)
     if operation in INBOX_READS | INBOX_WRITES:
         return dispatch_inbox(database, operation, payload)
     context = payload.pop('_telegram_context', None)
@@ -60,6 +65,10 @@ def _dispatch(database: Database, operation: str, payload: dict) -> object:
     billing = BillingService(database, cleanup_proofs=False)
     maintenance = MaintenanceService(database)
     payments = PaymentService(database, cleanup_proofs=False)
+    if operation == 'save_bill_notes':
+        return billing.save_bill_notes(**payload)
+    if operation == 'save_payment_notes':
+        return payments.save_notes(**payload)
     if operation == 'delete_payment':
         return payments.delete(**payload)
     if operation == 'undo_approval':

@@ -42,7 +42,7 @@ class ModalStore:
             try:
                 response = self.worker.remote(operation, payload, request_id=request_id,
                                               dataset=self.dataset, include_claim_details=True,
-                                              include_others_bill=True)
+                                              include_others_bill=True, include_landlord_notes=True)
                 if not response.get('ok'):
                     raise RuntimeError('Database worker did not confirm the request')
                 if write:
@@ -114,6 +114,9 @@ class RemoteBillingService:
     def __init__(self, store: ModalStore):
         self.store = store
 
+    def save_bill_notes(self, records):
+        return self.store.call('save_bill_notes', {'records': records}, write=True)
+
     def list_units(self):
         return [UnitRecord(**row) for row in self.store.state['units']]
 
@@ -155,6 +158,9 @@ class RemoteBillingService:
 class RemotePaymentService:
     def __init__(self, store: ModalStore):
         self.store = store
+
+    def save_notes(self, submission_id, notes):
+        return self.store.call('save_payment_notes', {'submission_id': submission_id, 'notes': notes}, write=True)
 
     def delete(self, submission_id):
         return self.store.call('delete_payment', {'submission_id': submission_id}, write=True)
@@ -217,7 +223,7 @@ class RemoteMaintenanceService:
         return [MaintenanceTicket(**row) for row in self.store.call('group_maintenance',
             {'group_chat_id': group_chat_id})]
 
-    def update_status(self, ticket_id, status, *, notify_group=False):
+    def update_status(self, ticket_id, status, *, notify_group=False, notes=None, expected_status=None):
         return MaintenanceTicket(**self.store.call('set_maintenance_status', dict(
-            ticket_id=ticket_id, status=status, notify_group=notify_group,
+            ticket_id=ticket_id, status=status, notify_group=notify_group, notes=notes, expected_status=expected_status,
         ), write=True))

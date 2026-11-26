@@ -42,6 +42,7 @@ class PaymentSubmission:
     resident_notes: str | None = None
     claim_lines: tuple[dict, ...] = ()
     previous_approved_amount_cents: int | None = None
+    landlord_notes: str | None = None
 
 
 def _submission_from_row(row) -> PaymentSubmission:  # type: ignore[no-untyped-def]
@@ -74,6 +75,7 @@ def _submission_from_row(row) -> PaymentSubmission:  # type: ignore[no-untyped-d
         resident_notes=row["resident_notes"],
         claim_lines=tuple(json.loads(row["claim_lines_json"] or '[]')),
         previous_approved_amount_cents=row["previous_approved_amount_cents"],
+        landlord_notes=row['landlord_notes'],
     )
 
 
@@ -254,6 +256,15 @@ class PaymentService:
         with self.database.connection() as connection:
             rows = connection.execute(sql, parameters).fetchall()
         return [_submission_from_row(row) for row in rows]
+
+    def save_notes(self, submission_id: int, notes: str) -> dict:
+        with self.database.connection() as connection:
+            cursor = connection.execute('''UPDATE payment_submissions SET landlord_notes = ?,
+                updated_at = CURRENT_TIMESTAMP WHERE id = ? AND deleted_at IS NULL''',
+                (notes.strip() or None, submission_id))
+            if cursor.rowcount != 1:
+                raise LookupError('Payment submission was not found')
+        return {'saved': True}
 
     def delete(self, submission_id: int, *, actor: str = 'dashboard') -> dict:
         """Cancel an unapproved request, retaining its row and audit history."""

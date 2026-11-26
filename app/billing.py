@@ -605,7 +605,7 @@ class BillingService:
                     electricity_previous=record['electricity_previous'], electricity_present=record['electricity_present'],
                     electricity_bill=record['electricity_bill'] if record['electricity_bill'] is not None else 0,
                     others_bill=record.get('others_bill'),
-                    notes=(existing['notes'] or '') if existing else '',
+                    notes=record.get('notes', (existing['notes'] or '') if existing else '') or '',
                     _connection=connection,
                 )
                 connection.execute(
@@ -613,6 +613,16 @@ class BillingService:
                     (self._due_date(period, record['due_day']), record['water_bill'] is not None,
                      record['electricity_bill'] is not None, bill.id),
                 )
+
+    def save_bill_notes(self, records: list[dict]) -> dict:
+        with self.database.connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            for record in records:
+                cursor = connection.execute('UPDATE monthly_bills SET notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                                            (str(record.get('notes') or '').strip() or None, record['id']))
+                if cursor.rowcount != 1:
+                    raise LookupError('Monthly bill was not found')
+        return {'saved': len(records)}
 
     def get_bill(self, bill_id: int) -> MonthlyBill:
         with self.database.connection() as connection:

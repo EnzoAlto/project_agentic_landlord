@@ -287,6 +287,9 @@ class Database:
                 if name not in inbox_columns:
                     connection.execute(f'ALTER TABLE telegram_inbox ADD COLUMN {name} {definition}')
             self._migrate_maintenance_requests(connection)
+            maintenance_columns = {row['name'] for row in connection.execute('PRAGMA table_info(maintenance_requests)')}
+            if 'landlord_notes' not in maintenance_columns:
+                connection.execute('ALTER TABLE maintenance_requests ADD COLUMN landlord_notes TEXT')
             self._migrate_payment_submissions(connection)
             self._seed_units(connection)
             self._migrate_billing_schema(connection)
@@ -405,6 +408,7 @@ class Database:
         columns = {
             "bill_id": "INTEGER",
             "deleted_at": "TEXT",
+            "landlord_notes": "TEXT",
             "resident_notes": "TEXT",
             "claim_lines_json": "TEXT NOT NULL DEFAULT '[]'",
             "amount_received_cents": "INTEGER",

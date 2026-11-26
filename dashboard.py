@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import base64
 from datetime import date, datetime, timedelta
 from pathlib import Path
 import os
@@ -88,9 +89,25 @@ def _payment_rows(submissions: list[PaymentSubmission]) -> list[dict]:
             "AR number": getattr(item, "ar_number", None) or "—",
             "Status": PAYMENT_STATUS_LABELS[item.status],
             "Created": item.created_at,
+            "Notes": item.landlord_notes or '',
         }
         for item in submissions
     ]
+
+
+def _render_submission_notes(submission, payments, key_prefix):
+    with st.form(f'{key_prefix}_notes_form_{submission.id}'):
+        notes = st.text_area('Notes', value=submission.landlord_notes or '',
+                             help='Landlord-only notes; not sent to residents or Qwen.',
+                             key=f'{key_prefix}_notes_{submission.id}')
+        if st.form_submit_button('Save notes'):
+            try:
+                payments.save_notes(submission.id, notes)
+            except (ValueError, LookupError, RemoteStorageError) as exc:
+                st.error(str(exc))
+            else:
+                st.session_state['payment_undo_feedback'] = ('success', f'Notes saved for payment #{submission.id}.')
+                st.rerun()
 
 
 def _bill_label(bill: MonthlyBill) -> str:
@@ -134,6 +151,7 @@ def _render_payment_review(
             st.markdown('**Notes from Resident**')
             st.text(resident_notes(submission))
             st.caption('Claims describe the resident’s intentions; they do not reserve future months or confirm payment.')
+            _render_submission_notes(submission, payments, 'review')
 
         with review_column:
             linked_unit = next((unit for unit in billing.list_units()
@@ -155,6 +173,7 @@ def _render_payment_review(
                     'Month': bill.billing_period,
                     'Due': bill.due_date,
                     'Outstanding': bill.outstanding_cents / 100,
+                    'Notes': bill.notes or '',
                 } for bill in bills]
                 chosen = st.data_editor(
                     choices, hide_index=True, width='stretch',
@@ -163,7 +182,7 @@ def _render_payment_review(
                         'Select': st.column_config.CheckboxColumn('Select', default=False),
                         'Outstanding': st.column_config.NumberColumn('Outstanding', format='₱%.2f'),
                     },
-                    disabled=['Month', 'Due', 'Outstanding'] if submission.status == 'pending_review' else True,
+                    disabled=['Month', 'Due', 'Outstanding', 'Notes'] if submission.status == 'pending_review' else True,
                     key=f'payment_months_{submission.id}',
                 )
                 chosen_rows = chosen.to_dict('records') if hasattr(chosen, 'to_dict') else list(chosen)
@@ -221,6 +240,7 @@ def _render_payment_review(
                     'Month': bill.billing_period,
                     'Apply': format_peso(applied),
                     'Remaining': format_peso(bill.outstanding_cents - applied),
+                    'Notes': bill.notes or '',
                 })
                 remainder -= applied
             if preview:
@@ -377,9 +397,31 @@ def _render_monthly_ledger(billing: BillingService) -> None:
                 "Outstanding": format_peso(bill.outstanding_cents),
                 "Status": BILL_STATUS_LABELS[bill.status],
                 "Overdue": warning,
+                "Notes": bill.notes or '',
+                "_id": bill.id,
             }
         )
-    st.dataframe(rows, width="stretch", hide_index=True)
+    edited = st.data_editor(
+        rows, width='stretch', hide_index=True,
+        column_config={'_id': None, 'Notes': st.column_config.TextColumn('Notes', width='large')},
+        disabled=[column for column in rows[0] if column != 'Notes'],
+        key=f'ledger_notes_{period_filter}_{status_filter}',
+    )
+    if st.button('Save notes', key='save_ledger_notes'):
+        records = edited.to_dict('records') if hasattr(edited, 'to_dict') else list(edited)
+        original = {bill.id: bill.notes or '' for bill in filtered}
+        changes = [{'id': row['_id'], 'notes': row['Notes'] or ''} for row in records
+                   if (row['Notes'] or '') != original[row['_id']]]
+        if not changes:
+            st.info('No notes changed.')
+        else:
+            try:
+                billing.save_bill_notes(changes)
+            except (ValueError, LookupError, RemoteStorageError) as exc:
+                st.error(str(exc))
+            else:
+                st.session_state['payment_undo_feedback'] = ('success', 'Bill notes saved.')
+                st.rerun()
 
 
 def _render_billing_setup(billing: BillingService) -> None:
@@ -425,6 +467,7 @@ def _render_billing_setup(billing: BillingService) -> None:
             "Bot status": unit.chatbot_status,
             "Telegram group": labels.get(unit.telegram_group_chat_id, "Not connected"),
             "Chat ID": str(unit.telegram_group_chat_id) if unit.telegram_group_chat_id else "—",
+            "Notes": (bill.notes or '') if bill else '',
         })
     config = {
         "_id": None,
@@ -467,6 +510,7 @@ def _render_billing_setup(billing: BillingService) -> None:
                 "electricity_present": saved_bill.electricity_present if saved_bill else None,
                 "electricity_bill": row["Electricity bill"],
                 "others_bill": row["Others Bill"] or 0,
+                "notes": row['Notes'] or '',
             })
         try:
             billing.save_month_table(period, records)
@@ -545,8 +589,9 @@ def _render_submission_history(payments: PaymentService, billing: BillingService
         rows = _payment_rows(filtered)
         for row, item in zip(rows, filtered):
             row['Action'] = ('Undo' if item.amount_received_cents else None) if item.status == 'approved' else 'Delete'
-        st.dataframe(
+        selection = st.dataframe(
             rows, width='stretch', hide_index=True,
+            key='submission_history_table', on_select='rerun', selection_mode='single-row',
             column_config={'Action': st.column_config.ButtonColumn(
                 'Action', key='undo_approval_click', on_click=_undo_history_approval,
                 args=(tuple(item.id for item in filtered), billing),
@@ -554,6 +599,12 @@ def _render_submission_history(payments: PaymentService, billing: BillingService
                 pinned=True,
             )},
         )
+        st.caption('Select a row to edit its landlord-only Notes below.')
+        selected_rows = selection.selection.rows
+        if selected_rows and 0 <= selected_rows[0] < len(filtered):
+            selected = filtered[selected_rows[0]]
+            st.markdown(f'**Notes for payment #{selected.id}**')
+            _render_submission_notes(selected, payments, 'history')
     else:
         st.info("No submissions match this filter.")
 
@@ -626,7 +677,7 @@ def _render_maintenance(maintenance: MaintenanceService) -> None:
     feedback = st.session_state.pop('maintenance_save_feedback', None)
     if feedback:
         if feedback['saved']:
-            st.success(f"Updated {feedback['saved']} request(s). Telegram notifications queued.")
+            st.success(f"Saved changes to {feedback['saved']} request(s). Only status changes notify the Telegram group.")
         for error in feedback['errors']:
             st.error(error)
     tickets = maintenance.list_all()
@@ -678,6 +729,7 @@ def _render_maintenance(maintenance: MaintenanceService) -> None:
                 "Urgency": ticket.urgency.title(),
                 "Status": MAINTENANCE_STATUS_LABELS[ticket.status],
                 "Created": ticket.created_at,
+                "Notes": ticket.landlord_notes or '',
             }
             for ticket in filtered
         ],
@@ -689,16 +741,17 @@ def _render_maintenance(maintenance: MaintenanceService) -> None:
         disabled=['ID', 'Group', 'Submitted by', 'Issue', 'Urgency', 'Created'],
         width="stretch", hide_index=True, key=editor_key,
     )
-    st.caption('Edit Status in the table, then save changes. Save before changing filters. Saved updates notify the original Telegram group.')
+    st.caption('Edit Status or landlord-only Notes, then save before changing filters. Only status changes notify the Telegram group.')
     if st.button('Save changes', type='primary', key='save_maintenance_changes'):
         rows = edited.to_dict('records') if hasattr(edited, 'to_dict') else list(edited)
         original = {ticket.id: ticket for ticket in filtered}
         status_keys = {label: status for status, label in MAINTENANCE_STATUS_LABELS.items()}
         changes = [row for row in rows
                    if row['ID'] in original
-                   and row['Status'] != MAINTENANCE_STATUS_LABELS[original[row['ID']].status]]
+                   and (row['Status'] != MAINTENANCE_STATUS_LABELS[original[row['ID']].status]
+                        or (row['Notes'] or '') != (original[row['ID']].landlord_notes or ''))]
         if not changes:
-            st.info('No status changes to save.')
+            st.info('No changes to save.')
             return
         saved, errors = 0, []
         for row in changes:
@@ -706,7 +759,8 @@ def _render_maintenance(maintenance: MaintenanceService) -> None:
                 status = status_keys.get(row['Status'])
                 if status is None:
                     raise ValueError('Select a valid status')
-                maintenance.update_status(row['ID'], status, notify_group=True)
+                maintenance.update_status(row['ID'], status, notify_group=True, notes=row['Notes'] or '',
+                                          expected_status=original[row['ID']].status)
             except (ValueError, LookupError, RemoteStorageError) as exc:
                 errors.append(f"Request #{row['ID']} was not confirmed saved: {exc}")
             else:
@@ -718,7 +772,7 @@ def _render_maintenance(maintenance: MaintenanceService) -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="Landlord Operations", page_icon="🏠", layout="wide"
+        page_title="Payuyo Apartments Management System", page_icon="🏠", layout="wide"
     )
     # Read only named top-level secrets. Never bundle a Modal token in GitHub.
     try:
@@ -745,7 +799,28 @@ def main() -> None:
         billing = BillingService(database)
         maintenance = MaintenanceService(database)
 
-    st.title("Landlord operations")
+    banner_path = Path(__file__).resolve().parent / 'app' / 'banner image.png'
+    if banner_path.is_file():
+        banner_data = base64.b64encode(banner_path.read_bytes()).decode('ascii')
+        st.html(
+            '<div style="position:relative;margin-bottom:5px;">'
+            f'<img src="data:image/png;base64,{banner_data}" '
+            'alt="Payuyo Apartments building" '
+            'style="display:block;width:100%;height:clamp(110px,22vw,220px);'
+            'object-fit:cover;object-position:center 25%;border-radius:12px;">'
+            '<div role="img" aria-label="Home" '
+            'style="position:absolute;left:24px;bottom:-20px;width:72px;height:72px;'
+            'display:flex;align-items:center;justify-content:center;font-size:46px;'
+            'line-height:1;background:#fffaf3;border:3px solid white;border-radius:18px;'
+            'box-shadow:0 3px 12px rgba(0,0,0,0.12);">🏠</div>'
+            '</div>'
+        )
+    # st.title("Payuyo Apartments Management System")
+    st.html(
+    '<h1 style="font-size:32px; font-weight:700; margin:0 0 12px;">'
+    'Payuyo Apartments Management System'
+    '</h1>'
+    )
     st.caption(f"{'Modal shared storage' if settings.storage_backend == 'modal' else 'Local SQLite'} · Telegram payments and maintenance")
     payments_tab, maintenance_tab = st.tabs(
         ["Payment requests", "Maintenance requests"]
